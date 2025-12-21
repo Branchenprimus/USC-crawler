@@ -52,7 +52,7 @@ The script will:
 
 ## n8n RAG Template
 
-The project includes an n8n workflow template (`n8n/RAG-template.json`) to help you analyze the extracted data using AI.
+The project includes an [n8n workflow template](https://n8n.io/workflows/5010-rag-starter-template-using-simple-vector-stores-form-trigger-and-openai/) (`n8n/RAG-template.json`) to help you analyze the extracted data using AI.
 
 ### Features
 This RAG (Retrieval Augmented Generation) workflow allows you to:
