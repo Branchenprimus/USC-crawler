@@ -5,14 +5,20 @@ import re
 import time
 import sys
 
-def fetch_page(page_num):
+def fetch_page(page_num, base_params=None):
     base_url = "https://urbansportsclub.com/de/venues"
-    params = {
-        "city_id": "9",
-        "plan_type": "2",
-        "type[]": "onsite",
-        "page": str(page_num)
-    }
+    if base_params is None:
+        # Default to Cologne if no params provided
+        base_params = {
+            "city_id": "9",
+            "plan_type": "2",
+            "type[]": "onsite"
+        }
+    
+    # Create a copy to avoid modifying the original dictionary across iterations
+    params = base_params.copy()
+    params["page"] = str(page_num)
+
     query_string = urllib.parse.urlencode(params, doseq=True)
     url = f"{base_url}?{query_string}"
     print(f"Fetching page {page_num} from API...", end="\r")
@@ -38,13 +44,37 @@ def extract_urls_from_html(html_content):
     pattern = r'href="(/de/venues/[^"]*)"'
     return re.findall(pattern, html_content)
 
-def discover_urls():
+def parse_url_params(url):
+    parsed = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qs(parsed.query)
+    # parse_qs returns lists for all values. We need to flatten them for single values,
+    # but keep lists for array parameters like type[] or district[]
+    # urllib.parse.urlencode with doseq=True expects lists for repeated params.
+    
+    clean_params = {}
+    for key, value in query_params.items():
+        if len(value) == 1 and not key.endswith('[]'):
+             clean_params[key] = value[0]
+        else:
+             clean_params[key] = value
+             
+    return clean_params
+
+def discover_urls(search_url=None, limit=None):
+    base_params = None
+    if search_url:
+        print(f"Parsing parameters from: {search_url}")
+        base_params = parse_url_params(search_url)
+        # Remove page parameter if present in the input URL, as we iterate it manually
+        if "page" in base_params:
+            del base_params["page"]
+            
     print("Starting URL discovery...")
     page = 1
     all_urls = set()
     
     while True:
-        data = fetch_page(page)
+        data = fetch_page(page, base_params)
         if not data:
             break
             
@@ -60,6 +90,12 @@ def discover_urls():
         
         for url in urls:
             all_urls.add(url)
+            if limit and len(all_urls) >= limit:
+                break
+        
+        if limit and len(all_urls) >= limit:
+            print(f"\nLimit of {limit} reached.")
+            break
             
         if not show_more:
             break
@@ -67,5 +103,9 @@ def discover_urls():
         page += 1
         time.sleep(0.5)
 
-    print(f"\nDiscovery complete. Found {len(all_urls)} unique URLs.")
-    return sorted(list(all_urls))
+    sorted_urls = sorted(list(all_urls))
+    if limit:
+        sorted_urls = sorted_urls[:limit]
+        
+    print(f"\nDiscovery complete. Found {len(sorted_urls)} unique URLs.")
+    return sorted_urls
