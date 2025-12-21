@@ -1,6 +1,6 @@
 # USC Venue Scraper
 
-This project automates the process of discovering and extracting venue information from Urban Sports Club.
+We all hate the USC filter, so I created this project to scrape the USC website and extract all venues. 
 
 ## Features
 
@@ -36,3 +36,27 @@ The script will:
 
 - Python 3+
 - Standard libraries only (`urllib`, `json`, `re`, `csv`, `os`, `glob`, `shutil`).
+
+## n8n RAG Template
+
+The project includes an n8n workflow template (`n8n/RAG-template.json`) to help you analyze the extracted data using AI.
+
+### Features
+This RAG (Retrieval Augmented Generation) workflow allows you to:
+1.  **Load Data**: Upload the generated `venues.csv` (or PDFs) to an in-memory vector store.
+2.  **Chat**: Interactively query your data using a chat interface powered by OpenAI (GPT-4o-mini).
+
+### Work Modes
+You can run n8n in two primary ways:
+
+-   **Local Hosting (Self-Hosted)**:
+    -   Run n8n on your own machine using `npm` or `docker`.
+    -   Best for privacy, free usage, and local development.
+    -   Command: `npx n8n` (requires Node.js).
+
+-   **Cloud Hosting (SaaS)**:
+    -   Use the managed n8n.io service.
+    -   Easiest to set up, secure, and accessible from anywhere.
+    -   Requires a subscription but handles maintenance for you.
+
+To use the template, simply import the `.json` file into your n8n workflows dashboard.
