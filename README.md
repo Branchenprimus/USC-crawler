@@ -26,6 +26,19 @@ Run the main script:
 python3 main.py
 ```
 
+### Options
+
+| Flag | Description | Example |
+|------|-------------|---------|
+| `--url` | Provide a custom USC search URL to target specific cities or filters (e.g. Berlin, different plan types). | `--url "https://urbansportsclub.com/de/venues?city_id=1&..."` |
+| `--test` | Run in test mode. Outputs to `test/` and limits to 5 venues by default. | `--test` |
+| `--limit` | Set a maximum number of venues to process. Useful for testing or partial scrapes. | `--limit 10` |
+
+**Example: Scrape venues in Berlin**
+```bash
+python3 main.py --url "https://urbansportsclub.com/de/venues?city_id=1&plan_type=2&type%5B%5D=onsite"
+```
+
 The script will:
 1. Crawl the API to find all venues.
 2. Download them to a temporary folder.
