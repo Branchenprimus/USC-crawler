@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--city", type=str, help="Name of the city to scrape (e.g., Köln, Berlin, München, Hamburg, Frankfurt).")
     parser.add_argument("--test", action="store_true", help="Run in test mode (limit venues, output to test folder).")
     parser.add_argument("--limit", type=int, help="Max number of venues to process. Defaults to 5 in test mode.")
+    parser.add_argument("--days", type=int, default=14, help="Number of days to search for classes ahead. Default=14.")
     args = parser.parse_args()
 
     # Configuration
@@ -56,7 +57,7 @@ def main():
             print(f"Warning: City '{args.city}' not found in known mapping. Supported cities include: {', '.join(CITY_MAPPING.keys())}")
     
     # Step 1: Discover URLs
-    venues, classes = crawler.discover_urls(search_url=args.url, limit=args.limit)
+    venues, classes = crawler.discover_urls(search_url=args.url, limit=args.limit, days=args.days)
     if not venues:
         print("No venues found. Exiting.")
         return

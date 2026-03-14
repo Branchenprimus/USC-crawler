@@ -5,6 +5,7 @@ import sys
 import concurrent.futures
 
 import requests
+from tqdm import tqdm
 
 def _download_single(url, target_dir, prefix, headers, session):
     filename = f"{prefix}_{os.path.basename(url)}.html"
@@ -40,19 +41,17 @@ def _download_list(urls, target_dir, prefix):
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         with requests.Session() as session:
             future_to_url = {executor.submit(_download_single, url, target_dir, prefix, headers, session): url for url in urls}
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
-                print(f"[{i+1}/{len(urls)}] Processing {prefix}...", end="\r")
-                try:
-                    res = future.result()
-                    if res == "skipped":
-                        skipped_count += 1
-                    elif res == "downloaded":
-                        downloaded_count += 1
-                except Exception:
-                    pass
-            
-    print(f"\n{prefix.capitalize()} download complete. New: {downloaded_count}, Skipped: {skipped_count}")
-
+            with tqdm(total=len(urls), desc=f"Downloading {prefix}s") as pbar:
+                for future in concurrent.futures.as_completed(future_to_url):
+                    try:
+                        res = future.result()
+                        if res == "skipped":
+                            skipped_count += 1
+                        elif res == "downloaded":
+                            downloaded_count += 1
+                    except Exception as e:
+                        print(f"\nError in download: {e}")
+                    pbar.update(1)
 def download_pages(venues, classes, temp_dir):
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)

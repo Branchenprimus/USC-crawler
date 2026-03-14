@@ -63,12 +63,12 @@ def parse_url_params(url):
 
 from datetime import datetime, timedelta
 
-def get_next_14_days():
+def get_next_days(days=14):
     today = datetime.now()
-    return [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(14)]
+    return [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
-def fetch_venue_classes(venue_url):
-    dates = get_next_14_days()
+def fetch_venue_classes(venue_url, days=14):
+    dates = get_next_days(days)
     class_urls = set()
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
@@ -89,7 +89,7 @@ def fetch_venue_classes(venue_url):
 
     return list(class_urls)
 
-def discover_urls(search_url=None, limit=None):
+def discover_urls(search_url=None, limit=None, days=14):
     base_params = None
     if search_url:
         print(f"Parsing parameters from: {search_url}")
@@ -138,10 +138,10 @@ def discover_urls(search_url=None, limit=None):
         
     print(f"\nVenue discovery complete. Found {len(sorted_venues)} unique venues.")
     
-    print("\nStarting class discovery for venues (next 14 days)...")
+    print(f"\nStarting class discovery for venues (next {days} days)...")
     all_classes = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        future_to_venue = {executor.submit(fetch_venue_classes, venue): venue for venue in sorted_venues}
+        future_to_venue = {executor.submit(fetch_venue_classes, venue, days): venue for venue in sorted_venues}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_venue)):
             print(f"[{i+1}/{len(sorted_venues)}] Processing venue classes...", end="\r")
             try:

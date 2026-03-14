@@ -20,7 +20,15 @@ We all hate the USC filter, so I created this project to scrape the USC website 
 
 ## Usage
 
-Run the main script:
+### 🚀 Launch Web Interface (Recommended)
+You can utilize the newly added Streamlit web Graphical Interface, featuring an intelligent crawler control panel and full RAG-powered Chat.
+
+```bash
+streamlit run ui.py
+```
+
+### 💻 CLI Usage
+Alternatively, run the main script structurally via terminal:
 
 ```bash
 python3 main.py
@@ -53,26 +61,29 @@ The script will:
 - Python 3+
 - Standard libraries only (`urllib`, `json`, `re`, `csv`, `os`, `glob`, `shutil`).
 
-## n8n RAG Template
+## Generating Embeddings for RAG
 
-The project includes an [n8n workflow template](https://n8n.io/workflows/5010-rag-starter-template-using-simple-vector-stores-form-trigger-and-openai/) (`n8n/RAG-template.json`) to help you analyze the extracted data using AI.
+Instead of relying on external workflow tools, this project includes a built-in Python script (`embed.py`) to generate vector embeddings for the extracted data directly using OpenAI's API. This prepares your dense denormalized data for Semantic/Similarity Search and Retrieval-Augmented Generation (RAG).
 
-### Features
-This RAG (Retrieval Augmented Generation) workflow allows you to:
-1.  **Load Data**: Upload the generated `venues.csv` (or PDFs) to an in-memory vector store.
-2.  **Chat**: Interactively query your data using a chat interface powered by OpenAI (GPT-4o-mini).
+### Setup
+1. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Create a `.env` file in the root directory (you can copy `.env.example`) and add your OpenAI API key:
+   ```env
+   OPENAI_API_KEY=your_api_key_here
+   ```
 
-### Work Modes
-You can run n8n in two primary ways:
+### Usage
+Run the main script first to gather your data. Then, run the embedding script:
+```bash
+python3 embed.py
+```
 
--   **Local Hosting (Self-Hosted)**:
-    -   Run n8n on your own machine using `npm` or `docker`.
-    -   Best for privacy, free usage, and local development.
-    -   Command: `npx n8n` (requires Node.js).
+By default, it reads `output/data.csv`, batches instructions, and outputs `output/embeddings.json` containing the original dataset mapped precisely to generated vector embeddings leveraging the `text-embedding-3-small` model.
 
--   **Cloud Hosting (SaaS)**:
-    -   Use the managed n8n.io service.
-    -   Easiest to set up, secure, and accessible from anywhere.
-    -   Requires a subscription but handles maintenance for you.
-
-To use the template, simply import the `.json` file into your n8n workflows dashboard.
+For testing datasets or specifying inputs directly:
+```bash
+python3 embed.py test/data.csv test/embeddings.json
+```

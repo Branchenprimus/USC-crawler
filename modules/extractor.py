@@ -2,12 +2,13 @@ import glob
 import re
 import csv
 import os
+from tqdm import tqdm
 
 def clean_text(text):
     if not text:
         return "N/A"
     text = re.sub(r'<[^>]+>', '', text)
-    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&mdash;", "-")
     return " ".join(text.split())
 
 def extract_content(pattern, text, default="N/A"):
@@ -96,18 +97,17 @@ def process_directory(input_dir, output_dir):
     if os.path.exists(venues_dir):
         html_files = glob.glob(os.path.join(venues_dir, "venue_*.html"))
         html_files.sort()
-        print(f"Processing {len(html_files)} venue files...")
-        for i, file_path in enumerate(html_files):
-            if i > 0 and i % 50 == 0:
-                print(f"Processed {i}/{len(html_files)} venues...", end="\r")
-            try:
-                venue_info = extract_venue_data(file_path)
-                # Parse out the core name from the url to map correctly, or match on name.
-                # Actually, the Class "Venue" string often includes city/address. 
-                # Let's clean the Class Venue string or just map by the exact "Name" field.
-                venue_map[venue_info["Name"]] = venue_info
-            except Exception as e:
-                print(f"\nError processing {file_path}: {e}")
+        with tqdm(total=len(html_files), desc="Processing venue files") as pbar:
+            for file_path in html_files:
+                try:
+                    venue_info = extract_venue_data(file_path)
+                    # Parse out the core name from the url to map correctly, or match on name.
+                    # Actually, the Class "Venue" string often includes city/address. 
+                    # Let's clean the Class Venue string or just map by the exact "Name" field.
+                    venue_map[venue_info["Name"]] = venue_info
+                except Exception as e:
+                    print(f"\nError processing {file_path}: {e}")
+                pbar.update(1)
                 
     all_data = []
 
@@ -116,61 +116,68 @@ def process_directory(input_dir, output_dir):
     if os.path.exists(classes_dir):
         class_files = glob.glob(os.path.join(classes_dir, "class_*.html"))
         class_files.sort()
-        print(f"\nProcessing {len(class_files)} class files...")
-        for i, file_path in enumerate(class_files):
-            if i > 0 and i % 50 == 0:
-                print(f"Processed {i}/{len(class_files)} classes...", end="\r")
-            try:
-                c_info = extract_class_data(file_path)
-                
-                # The trailing part of the Class venue string may contain the address. 
-                # We attempt to find the matching venue by fuzzy matching the string.
-                matched_venue = None
-                class_venue_base = c_info["Venue"].split(',')[0].strip()
-                
-                # Check for an exact substring match first
-                for v_name, v_data in venue_map.items():
-                    if class_venue_base.lower() in v_name.lower() or v_name.lower() in class_venue_base.lower():
-                        matched_venue = v_data
-                        break
-                        
-                # If exact substring doesn't work, try difflib for closest string match
-                if not matched_venue:
-                    import difflib
-                    all_venue_names = list(venue_map.keys())
-                    matches = difflib.get_close_matches(class_venue_base, all_venue_names, n=1, cutoff=0.4)
-                    if matches:
-                        matched_venue = venue_map[matches[0]]
-                
-                # Default empty venue fields if no match
-                if not matched_venue:
-                    matched_venue = {
-                        "Name": c_info["Venue"],
-                        "Rating": "N/A",
-                        "Disciplines": "N/A",
-                        "Address": "N/A",
-                        "Description": "N/A"
-                    }
+        with tqdm(total=len(class_files), desc="Processing class files") as pbar:
+            for file_path in class_files:
+                try:
+                    c_info = extract_class_data(file_path)
+                    
+                    # The trailing part of the Class venue string may contain the address. 
+                    # We attempt to find the matching venue by fuzzy matching the string.
+                    matched_venue = None
+                    class_venue_base = c_info["Venue"].split(',')[0].strip()
+                    
+                    # Check for an exact substring match first
+                    for v_name, v_data in venue_map.items():
+                        if class_venue_base.lower() in v_name.lower() or v_name.lower() in class_venue_base.lower():
+                            matched_venue = v_data
+                            break
+                            
+                    # If exact substring doesn't work, try difflib for closest string match
+                    if not matched_venue:
+                        import difflib
+                        all_venue_names = list(venue_map.keys())
+                        matches = difflib.get_close_matches(class_venue_base, all_venue_names, n=1, cutoff=0.4)
+                        if matches:
+                            matched_venue = venue_map[matches[0]]
+                    
+                    # Default empty venue fields if no match
+                    if not matched_venue:
+                        matched_venue = {
+                            "Name": c_info["Venue"],
+                            "Rating": "N/A",
+                            "Disciplines": "N/A",
+                            "Address": "N/A",
+                            "Description": "N/A"
+                        }
 
-                all_data.append({
-                    "Class Title": c_info["Name"],
-                    "Class Date": c_info["Date_Time"],
-                    "Class Category": c_info["Category"],
-                    "Class Description": c_info["Description"],
-                    "Venue Name": matched_venue["Name"],
-                    "Venue Rating": matched_venue["Rating"],
-                    "Venue Disciplines": matched_venue["Disciplines"],
-                    "Venue Address": matched_venue["Address"],
-                    "Venue Description": matched_venue["Description"]
-                })
-            except Exception as e:
-                print(f"\nError processing {file_path}: {e}")
+                    # Skip placeholder classes
+                    if c_info["Name"] == "Kurse auf der Partner-Website":
+                        pbar.update(1)
+                        continue
+
+                    combined_text = f"Class: {c_info['Name']} on {c_info['Date_Time']} - Category: {c_info['Category']} - Description: {c_info['Description']} - Venue: {matched_venue['Name']} ({matched_venue['Rating']}) - Disciplines: {matched_venue['Disciplines']} - Address: {matched_venue['Address']} - Venue Description: {matched_venue['Description']}"
+
+                    all_data.append({
+                        "Class Title": c_info["Name"],
+                        "Class Date": c_info["Date_Time"],
+                        "Class Category": c_info["Category"],
+                        "Class Description": c_info["Description"],
+                        "Venue Name": matched_venue["Name"],
+                        "Venue Rating": matched_venue["Rating"],
+                        "Venue Disciplines": matched_venue["Disciplines"],
+                        "Venue Address": matched_venue["Address"],
+                        "Venue Description": matched_venue["Description"],
+                        "Combined_Text": combined_text
+                    })
+                except Exception as e:
+                    print(f"\nError processing {file_path}: {e}")
+                pbar.update(1)
                 
     if all_data:
         unified_file = os.path.join(output_dir, "data.csv")
         csv_columns = [
             "Class Title", "Class Date", "Class Category", "Class Description",
-            "Venue Name", "Venue Rating", "Venue Disciplines", "Venue Address", "Venue Description"
+            "Venue Name", "Venue Rating", "Venue Disciplines", "Venue Address", "Venue Description", "Combined_Text"
         ]
         try:
             with open(unified_file, 'w', newline='', encoding='utf-8') as csvfile:
