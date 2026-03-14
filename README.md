@@ -4,19 +4,19 @@ We all hate the USC filter, so I created this project to scrape the USC website 
 
 ## Features
 
-- **Automated Discovery**: Crawls the USC API to discover available venues associated with specific city and plan types.
-- **Bulk Downloading**: Downloads venue HTML pages efficiently.
-- **Data Extraction**: Parses HTML content to extract structrued data including names, ratings, disciplines, descriptions, and addresses.
-- **CSV Export**: Outputs the data into a clean, quoted CSV file.
+- **Automated Discovery**: Crawls the USC API to intelligently map Target Cities and parse all associated Venues.
+- **14-Day Scheduling**: For all discovered venues, retrieves their complete scheduled Course/Class offerings across the upcoming 14 days.
+- **Bulk Downloading**: Concurrently bulk downloads both Venue and Class HTML datasets securely with rate limiting.
+- **RAG-Optimized Denormalized Output**: Parses HTML to comprehensively join robust Venue data directly with each individual Class row via intelligent fuzzy-string matching (`difflib`). Returns a rich, single `data.csv` table optimized directly for RAG similarity search indexing.
 
 ## Structure
 
-- `main.py`: Entry point for the scraper.
+- `main.py`: Entry point for the scraper pipeline.
 - `modules/`: Contains the core logic components.
-  - `crawler.py`: Handles API interaction and URL discovery.
-  - `downloader.py`: Manages file downloads.
-  - `extractor.py`: Parses HTML and writes CSV.
-- `output/`: Directory where the final `venues.csv` is saved.
+  - `crawler.py`: Handles API interaction, discovering URLs for Venues and their 14-day Class schedules using Multithreading.
+  - `downloader.py`: Manages accelerated concurrent HTML downloads.
+  - `extractor.py`: Parses HTML via Regex, aligns Class locations with downloaded Venues securely, and dynamically outputs the dense, unified `data.csv`.
+- `output/`: Directory where the final resulting `data.csv` is populated.
 
 ## Usage
 
@@ -30,20 +30,23 @@ python3 main.py
 
 | Flag | Description | Example |
 |------|-------------|---------|
-| `--url` | Provide a custom USC search URL to target specific cities or filters (e.g. Berlin, different plan types). | `--url "https://urbansportsclub.com/de/venues?city_id=1&..."` |
-| `--test` | Run in test mode. Outputs to `test/` and limits to 5 venues by default. | `--test` |
+| `--city` | Target a built-in supported city explicitly to crawl (e.g. Köln, Berlin, München, Hamburg, Frankfurt). | `--city Köln` |
+| `--test` | Run in test mode. Outputs to `test/data.csv`. Limits the crawl explicitly to exactly 5 venues, avoiding long wait-times, while retrieving the complete schedule for those 5 venues. | `--test` |
 | `--limit` | Set a maximum number of venues to process. Useful for testing or partial scrapes. | `--limit 10` |
+| `--url` | Provide a custom USC search URL to target specific cities or filters entirely overriding built-in default flags. | `--url "https://urbansportsclub.com/de/venues?city_id=1..."` |
 
-**Example: Scrape venues in Berlin**
+**Example: Scrape all Venues and 14-Day Classes in Köln in Test Mode**
 ```bash
-python3 main.py --url "https://urbansportsclub.com/de/venues?city_id=1&plan_type=2&type%5B%5D=onsite"
+python3 main.py --city Köln --test
 ```
 
 The script will:
-1. Crawl the API to find all venues.
-2. Download them to a temporary folder.
-3. Extract information to `output/venues.csv`.
-4. Clean up the temporary files automatically.
+1. Crawl the API to find the target city venues (max 5 due to `--test`).
+2. Discover all Class URLs happening within the next 14 days for those specific Venues.
+3. Rapidly multithread download all HTML instances to a temporary folder.
+4. Extract structural information and map the Classes precisely to their Venues.
+5. Create a flattened `test/data.csv` table optimized for AI.
+6. Clean up the temporary files automatically.
 
 ## Requirements
 

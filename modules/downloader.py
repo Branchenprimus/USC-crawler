@@ -2,12 +2,34 @@ import os
 import time
 import urllib.request
 import sys
+import concurrent.futures
 
-def download_venues(urls, temp_dir):
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
+import requests
+
+def _download_single(url, target_dir, prefix, headers, session):
+    filename = f"{prefix}_{os.path.basename(url)}.html"
+    file_path = os.path.join(target_dir, filename)
+    
+    if os.path.exists(file_path):
+        return "skipped"
         
-    print(f"Downloading {len(urls)} venues to {temp_dir}...")
+    full_url = f"https://urbansportsclub.com{url}"
+    try:
+        response = session.get(full_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        with open(file_path, 'wb') as f:
+            f.write(response.content)
+        time.sleep(0.05) # Rate limiting gracefully, lowered since session is faster
+        return "downloaded"
+    except Exception as e:
+        print(f"\nError downloading {url}: {e}")
+        return "error"
+
+def _download_list(urls, target_dir, prefix):
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+        
+    print(f"Downloading {len(urls)} {prefix}s to {target_dir}...")
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36"
     }
@@ -15,26 +37,30 @@ def download_venues(urls, temp_dir):
     downloaded_count = 0
     skipped_count = 0
     
-    for i, url in enumerate(urls):
-        filename = f"venue_{os.path.basename(url)}.html"
-        file_path = os.path.join(temp_dir, filename)
-        
-        if os.path.exists(file_path):
-            skipped_count += 1
-            continue
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        with requests.Session() as session:
+            future_to_url = {executor.submit(_download_single, url, target_dir, prefix, headers, session): url for url in urls}
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
+                print(f"[{i+1}/{len(urls)}] Processing {prefix}...", end="\r")
+                try:
+                    res = future.result()
+                    if res == "skipped":
+                        skipped_count += 1
+                    elif res == "downloaded":
+                        downloaded_count += 1
+                except Exception:
+                    pass
             
-        full_url = f"https://urbansportsclub.com{url}"
-        print(f"[{i+1}/{len(urls)}] Fetching {url}...", end="\r")
+    print(f"\n{prefix.capitalize()} download complete. New: {downloaded_count}, Skipped: {skipped_count}")
+
+def download_pages(venues, classes, temp_dir):
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
         
-        req = urllib.request.Request(full_url, headers=headers)
-        try:
-            with urllib.request.urlopen(req) as response:
-                content = response.read()
-                with open(file_path, 'wb') as f:
-                    f.write(content)
-            downloaded_count += 1
-            time.sleep(0.2) # Rate limiting
-        except Exception as e:
-            print(f"\nError downloading {url}: {e}")
-            
-    print(f"\nDownload complete. New: {downloaded_count}, Skipped: {skipped_count}")
+    venues_dir = os.path.join(temp_dir, "venues")
+    classes_dir = os.path.join(temp_dir, "classes")
+    
+    _download_list(venues, venues_dir, "venue")
+    if classes:
+        _download_list(classes, classes_dir, "class")
+

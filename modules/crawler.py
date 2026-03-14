@@ -4,6 +4,7 @@ import json
 import re
 import time
 import sys
+import concurrent.futures
 
 def fetch_page(page_num, base_params=None):
     base_url = "https://urbansportsclub.com/de/venues"
@@ -60,6 +61,34 @@ def parse_url_params(url):
              
     return clean_params
 
+from datetime import datetime, timedelta
+
+def get_next_14_days():
+    today = datetime.now()
+    return [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(14)]
+
+def fetch_venue_classes(venue_url):
+    dates = get_next_14_days()
+    class_urls = set()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
+    }
+    import requests
+    
+    with requests.Session() as session:
+        for date in dates:
+            url = f"https://urbansportsclub.com{venue_url}?date={date}"
+            try:
+                response = session.get(url, headers=headers, timeout=10)
+                html = response.text
+                matches = re.findall(r'data-href="(/de/class-details/[^"]+)"', html)
+                for class_url in matches:
+                    class_urls.add(class_url)
+            except Exception as e:
+                pass # Silently skip errors on individual dates to avoid spam
+
+    return list(class_urls)
+
 def discover_urls(search_url=None, limit=None):
     base_params = None
     if search_url:
@@ -71,7 +100,7 @@ def discover_urls(search_url=None, limit=None):
             
     print("Starting URL discovery...")
     page = 1
-    all_urls = set()
+    all_venues = set()
     
     while True:
         data = fetch_page(page, base_params)
@@ -89,12 +118,12 @@ def discover_urls(search_url=None, limit=None):
         urls = extract_urls_from_html(content)
         
         for url in urls:
-            all_urls.add(url)
-            if limit and len(all_urls) >= limit:
+            all_venues.add(url)
+            if limit and len(all_venues) >= limit:
                 break
         
-        if limit and len(all_urls) >= limit:
-            print(f"\nLimit of {limit} reached.")
+        if limit and len(all_venues) >= limit:
+            print(f"\nVenue limit of {limit} reached.")
             break
             
         if not show_more:
@@ -103,9 +132,26 @@ def discover_urls(search_url=None, limit=None):
         page += 1
         time.sleep(0.5)
 
-    sorted_urls = sorted(list(all_urls))
+    sorted_venues = sorted(list(all_venues))
     if limit:
-        sorted_urls = sorted_urls[:limit]
+        sorted_venues = sorted_venues[:limit]
         
-    print(f"\nDiscovery complete. Found {len(sorted_urls)} unique URLs.")
-    return sorted_urls
+    print(f"\nVenue discovery complete. Found {len(sorted_venues)} unique venues.")
+    
+    print("\nStarting class discovery for venues (next 14 days)...")
+    all_classes = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        future_to_venue = {executor.submit(fetch_venue_classes, venue): venue for venue in sorted_venues}
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_venue)):
+            print(f"[{i+1}/{len(sorted_venues)}] Processing venue classes...", end="\r")
+            try:
+                classes = future.result()
+                for c in classes:
+                    all_classes.add(c)
+            except Exception:
+                pass
+        
+    sorted_classes = sorted(list(all_classes))
+    print(f"\nClass discovery complete. Found {len(sorted_classes)} unique classes.")
+    
+    return sorted_venues, sorted_classes
