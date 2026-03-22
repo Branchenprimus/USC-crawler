@@ -6,6 +6,8 @@ import time
 import sys
 import concurrent.futures
 
+CLASS_DISCOVERY_WORKERS = 15
+
 def fetch_page(page_num, base_params=None):
     base_url = "https://urbansportsclub.com/de/venues"
     if base_params is None:
@@ -138,9 +140,9 @@ def discover_urls(search_url=None, limit=None, days=14):
         
     print(f"\nVenue discovery complete. Found {len(sorted_venues)} unique venues.")
     
-    print(f"\nStarting class discovery for venues (next {days} days)...")
+    print(f"\nStarting class discovery for venues (next {days} days) using {CLASS_DISCOVERY_WORKERS} parallel workers...")
     all_classes = set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CLASS_DISCOVERY_WORKERS) as executor:
         future_to_venue = {executor.submit(fetch_venue_classes, venue, days): venue for venue in sorted_venues}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_venue)):
             print(f"[{i+1}/{len(sorted_venues)}] Processing venue classes...", end="\r")

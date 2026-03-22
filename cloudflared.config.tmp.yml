@@ -1,0 +1,14 @@
+tunnel: 3ef51c08-231a-4785-9135-a402f8f0f6ca
+credentials-file: /home/jan/.cloudflared/3ef51c08-231a-4785-9135-a402f8f0f6ca.json
+protocol: http2
+
+ingress:
+  - hostname: usc-crawler.darwin-labs.org
+    service: http://localhost:8501
+  - hostname: kcal-tracker.darwin-labs.org
+    service: http://localhost:8787
+  - hostname: n8n.darwin-labs.org
+    service: http://localhost:5678
+  - hostname: tunnel.darwin-labs.org
+    service: ssh://localhost:22
+  - service: http_status:404

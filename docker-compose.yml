@@ -1,0 +1,26 @@
+services:
+  usc-crawler:
+    build: .
+    container_name: usc-crawler
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+      - ./output:/app/output
+      - ./test:/app/test
+    restart: unless-stopped
+    develop:
+      watch:
+        # Rebuild and restart the container whenever app code or config changes.
+        - action: rebuild
+          path: .
+          ignore:
+            - output/**
+            - test/**
+            - .git/**
+            - .venv/**
+            - __pycache__/**
+            - logs/**
+            - "*.pyc"

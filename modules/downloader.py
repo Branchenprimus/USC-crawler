@@ -7,6 +7,8 @@ import concurrent.futures
 import requests
 from tqdm import tqdm
 
+DOWNLOAD_WORKERS = 20
+
 def _download_single(url, target_dir, prefix, headers, session):
     filename = f"{prefix}_{os.path.basename(url)}.html"
     file_path = os.path.join(target_dir, filename)
@@ -38,7 +40,8 @@ def _download_list(urls, target_dir, prefix):
     downloaded_count = 0
     skipped_count = 0
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    print(f"Using {DOWNLOAD_WORKERS} parallel download workers for {prefix}s...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
         with requests.Session() as session:
             future_to_url = {executor.submit(_download_single, url, target_dir, prefix, headers, session): url for url in urls}
             with tqdm(total=len(urls), desc=f"Downloading {prefix}s") as pbar:
@@ -62,4 +65,3 @@ def download_pages(venues, classes, temp_dir):
     _download_list(venues, venues_dir, "venue")
     if classes:
         _download_list(classes, classes_dir, "class")
-

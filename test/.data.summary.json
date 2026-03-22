@@ -1,0 +1,17 @@
+{
+  "data_mtime": 1773494530.8924983,
+  "embeddings_mtime": 1773526528.3572323,
+  "summary": {
+    "city": "Berlin",
+    "classes": 454,
+    "venues": 5,
+    "categories": 5,
+    "data_size": "1.4 MB",
+    "data_updated": "2026-03-14 13:22",
+    "token_count": 185611,
+    "embedding_rows": 454,
+    "embedding_dims": 1536,
+    "embedding_size": "19.7 MB",
+    "embedding_updated": "2026-03-14 22:15"
+  }
+}

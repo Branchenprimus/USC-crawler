@@ -20,7 +20,29 @@ We all hate the USC filter, so I created this project to scrape the USC website 
 
 ## Usage
 
-### 🚀 Launch Web Interface (Recommended)
+### 🐳 Launch via Docker (Recommended)
+You can seamlessly run the complete application inside an isolated Docker container, exposing the graphical interface.
+
+1. Ensure Docker Desktop or the Docker Engine is running.
+2. Create your environment file:
+```bash
+cp .env.example .env
+```
+3. Add your OpenAI API key to `.env`:
+```env
+OPENAI_API_KEY=your_api_key_here
+```
+4. Build and spin up the environment:
+```bash
+docker compose up --build -d
+```
+5. Access the app locally at [http://localhost:8501](http://localhost:8501)
+6. Stop the stack when finished:
+```bash
+docker compose down
+```
+
+### 🚀 Launch Web Interface (Local Python)
 You can utilize the newly added Streamlit web Graphical Interface, featuring an intelligent crawler control panel and full RAG-powered Chat.
 
 ```bash
@@ -87,3 +109,30 @@ For testing datasets or specifying inputs directly:
 ```bash
 python3 embed.py test/data.csv test/embeddings.json
 ```
+
+The embedding script now defaults to faster settings:
+- batch size `200`
+- concurrency `3`
+- retry-based backoff instead of fixed sleeps
+
+You can override them when needed:
+```bash
+python3 embed.py --batch-size 100 --concurrency 2
+python3 embed.py output/data.csv output/embeddings.json --model text-embedding-3-small --max-retries 5
+```
+
+### Estimate Embedding Cost
+Before generating embeddings, you can estimate token volume and expected OpenAI cost for any dataset:
+
+```bash
+python3 estimate_embedding_cost.py
+```
+
+Useful variants:
+```bash
+python3 estimate_embedding_cost.py test/data.csv
+python3 estimate_embedding_cost.py --model text-embedding-3-large
+python3 estimate_embedding_cost.py --batch
+```
+
+The estimator uses the same `Combined_Text` column as `embed.py` and reports row count, token count, average size, and estimated price.

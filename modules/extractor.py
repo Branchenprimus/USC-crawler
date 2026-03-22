@@ -147,7 +147,9 @@ def process_directory(input_dir, output_dir):
                             "Rating": "N/A",
                             "Disciplines": "N/A",
                             "Address": "N/A",
-                            "Description": "N/A"
+                            "Description": "N/A",
+                            "Website": "N/A",
+                            "USC_URL": "N/A",
                         }
 
                     # Skip placeholder classes
@@ -167,6 +169,8 @@ def process_directory(input_dir, output_dir):
                         "Venue Disciplines": matched_venue["Disciplines"],
                         "Venue Address": matched_venue["Address"],
                         "Venue Description": matched_venue["Description"],
+                        "Venue Website": matched_venue["Website"],
+                        "Venue USC URL": matched_venue["USC_URL"],
                         "Combined_Text": combined_text
                     })
                 except Exception as e:
@@ -177,7 +181,8 @@ def process_directory(input_dir, output_dir):
         unified_file = os.path.join(output_dir, "data.csv")
         csv_columns = [
             "Class Title", "Class Date", "Class Category", "Class Description",
-            "Venue Name", "Venue Rating", "Venue Disciplines", "Venue Address", "Venue Description", "Combined_Text"
+            "Venue Name", "Venue Rating", "Venue Disciplines", "Venue Address",
+            "Venue Description", "Venue Website", "Venue USC URL", "Combined_Text"
         ]
         try:
             with open(unified_file, 'w', newline='', encoding='utf-8') as csvfile:
