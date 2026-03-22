@@ -1,9 +1,7 @@
-import os
 import shutil
-import glob
 import argparse
 import time
-from modules import crawler, downloader, extractor
+from modules import crawler, downloader, extractor, datasets
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape Urban Sports Club venues.")
@@ -17,13 +15,11 @@ def main():
     # Configuration
     TEMP_DIR = "temp"
     if args.test:
-        OUTPUT_DIR = "test"
+        output_mode_root = "test"
         if args.limit is None:
             args.limit = 5
     else:
-        OUTPUT_DIR = "output"
-        
-    OUTPUT_FILE = os.path.join(OUTPUT_DIR, "data.csv")
+        output_mode_root = "output"
     
     start_time = time.time()
     print("=== USC Venue & Class Scraper ===")
@@ -47,6 +43,21 @@ def main():
         "bremen": 18
     }
     
+    city_id_to_name = {
+        1: "Berlin",
+        2: "München",
+        3: "Hamburg",
+        4: "Frankfurt",
+        5: "Stuttgart",
+        9: "Köln",
+        10: "Düsseldorf",
+        11: "Leipzig",
+        13: "Hannover",
+        14: "Nürnberg",
+        16: "Bonn",
+        18: "Bremen",
+    }
+
     if args.city and not args.url:
         city_name = args.city.lower()
         if city_name in CITY_MAPPING:
@@ -55,6 +66,22 @@ def main():
             print(f"Targeting city: {args.city} (ID: {city_id})")
         else:
             print(f"Warning: City '{args.city}' not found in known mapping. Supported cities include: {', '.join(CITY_MAPPING.keys())}")
+
+    target_city = args.city
+    if not target_city and args.url:
+        url_params = crawler.parse_url_params(args.url)
+        try:
+            city_id = int(url_params.get("city_id"))
+        except (TypeError, ValueError):
+            city_id = None
+        target_city = city_id_to_name.get(city_id, "custom")
+
+    if not target_city:
+        target_city = "custom"
+
+    output_config = datasets.get_dataset_config(target_city, args.test)
+    OUTPUT_DIR = output_config["dataset_dir"]
+    print(f"Writing dataset to: {OUTPUT_DIR}")
     
     # Step 1: Discover URLs
     venues, classes = crawler.discover_urls(search_url=args.url, limit=args.limit, days=args.days)

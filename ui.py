@@ -17,7 +17,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-from modules import crawler
+from modules import crawler, datasets
 
 load_dotenv()
 
@@ -469,14 +469,11 @@ def count_city_venues(city):
 
 
 def get_reference_summary(prefer_test_data):
-    candidates = [get_dataset_config(prefer_test_data)]
-    fallback = get_dataset_config(not prefer_test_data)
-    candidates.append(fallback)
-
-    for candidate in candidates:
-        summary = load_dataset_summary(candidate["data_path"], candidate["embeddings_path"])
-        if summary:
-            return summary
+    for mode in [prefer_test_data, not prefer_test_data]:
+        for candidate in datasets.iter_dataset_configs(mode):
+            summary = load_dataset_summary(candidate["data_path"], candidate["embeddings_path"])
+            if summary:
+                return summary
     return None
 
 
@@ -500,40 +497,51 @@ def estimate_embedding_cost_from_tokens(token_count, model="text-embedding-3-sma
     return money(total_cost)
 
 
-def get_dataset_config(use_test_data):
-    if use_test_data:
-        return {
-            "label": "Test",
-            "data_path": "test/data.csv",
-            "embeddings_path": "test/embeddings.json",
-        }
+def find_dataset_for_city(selected_city, use_test_data):
+    preferred = datasets.get_dataset_config(selected_city, use_test_data)
+    preferred_summary = load_dataset_summary(
+        preferred["data_path"],
+        preferred["embeddings_path"],
+    )
+    if preferred_summary:
+        preferred["summary"] = preferred_summary
+        return preferred
 
-    return {
-        "label": "Production",
-        "data_path": "output/data.csv",
-        "embeddings_path": "output/embeddings.json",
-    }
+    legacy = datasets.get_legacy_dataset_config(use_test_data)
+    legacy_summary = load_dataset_summary(
+        legacy["data_path"],
+        legacy["embeddings_path"],
+    )
+    if (
+        legacy_summary
+        and legacy_summary.get("city")
+        and legacy_summary["city"].lower() == selected_city.lower()
+    ):
+        legacy["summary"] = legacy_summary
+        return legacy
+
+    return preferred
 
 
 def get_available_datasets():
-    datasets = []
+    available = []
     for use_test_data in [False, True]:
-        config = get_dataset_config(use_test_data)
-        summary = load_dataset_summary(config["data_path"], config["embeddings_path"])
-        if summary:
-            datasets.append(
-                {
-                    **config,
-                    "use_test_data": use_test_data,
-                    "summary": summary,
-                }
-            )
-    return datasets
+        for config in datasets.iter_dataset_configs(use_test_data):
+            summary = load_dataset_summary(config["data_path"], config["embeddings_path"])
+            if summary:
+                available.append(
+                    {
+                        **config,
+                        "use_test_data": use_test_data,
+                        "summary": summary,
+                    }
+                )
+    return available
 
 
 def choose_dataset(selected_city, prefer_test_data):
-    dataset_config = get_dataset_config(prefer_test_data)
-    dataset_summary = load_dataset_summary(
+    dataset_config = find_dataset_for_city(selected_city, prefer_test_data)
+    dataset_summary = dataset_config.get("summary") or load_dataset_summary(
         dataset_config["data_path"],
         dataset_config["embeddings_path"],
     )
@@ -541,11 +549,11 @@ def choose_dataset(selected_city, prefer_test_data):
     if not dataset_summary:
         return dataset_config, None, None
 
-    if dataset_summary["city"] and dataset_summary["city"].lower() != selected_city.lower():
+    if dataset_config.get("is_legacy"):
         return (
             dataset_config,
             dataset_summary,
-            f"You are viewing the {dataset_summary['city']} {dataset_config['label'].lower()} dataset while {selected_city} is selected.",
+            f"Using the legacy {dataset_config['label'].lower()} dataset for {selected_city}. A new crawl will store future runs in a city-specific folder.",
         )
 
     return dataset_config, dataset_summary, None
