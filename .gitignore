@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 temp/
 output/
+.crawler_jobs/
 .gemini/
 .agent/
 .env

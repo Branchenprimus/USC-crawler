@@ -2,9 +2,12 @@ import json
 import os
 import html
 import re
+import signal
+import shlex
 import subprocess
 import time
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -38,6 +41,7 @@ CITY_OPTIONS = [
     "Bonn",
     "Bremen",
 ]
+CONTRACT_OPTIONS = ["S", "M", "L", "XL"]
 CITY_IDS = {
     "berlin": 1,
     "münchen": 2,
@@ -60,10 +64,12 @@ MODEL_PRICING_PER_MILLION = {
 }
 CHAT_MODEL = "gpt-4o"
 UI_STATE_VERSION = "venue-tiles-v1"
+CRAWL_JOB_LOG_DIR = Path(".crawler_jobs")
+SUMMARY_SCHEMA_VERSION = 2
 
 
 st.title("USC Venue Explorer")
-st.caption("Choose a city first, then inspect the dataset or start a fresh crawl.")
+st.caption("Choose a city and contract first, then inspect the matching dataset or start a fresh crawl.")
 st.markdown(
     """
     <style>
@@ -306,6 +312,70 @@ def infer_dataset_city(df):
     return pd.Series(cities).mode().iat[0]
 
 
+def infer_dataset_days(df):
+    if "Class Date" not in df.columns:
+        return None
+
+    english_months = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    german_months = {
+        "januar": 1, "februar": 2, "märz": 3, "maerz": 3, "april": 4,
+        "mai": 5, "juni": 6, "juli": 7, "august": 8, "september": 9,
+        "oktober": 10, "november": 11, "dezember": 12,
+    }
+
+    raw_labels = []
+    for value in df["Class Date"].dropna().astype(str):
+        label = value.split("|", 1)[0].strip()
+        if label and label != "N/A":
+            raw_labels.append(label)
+
+    inferred_year = None
+    for label in raw_labels:
+        match = re.search(r"\b(\d{4})\b", label)
+        if match:
+            inferred_year = int(match.group(1))
+            break
+    if inferred_year is None:
+        inferred_year = datetime.now().year
+
+    normalized_dates = set()
+    fallback_labels = set()
+
+    for label in raw_labels:
+        normalized = label.replace(",", "").strip()
+        english_match = re.match(r"^(?P<month>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})$", normalized)
+        if english_match:
+            month = english_months.get(english_match.group("month").lower())
+            if month:
+                normalized_dates.add(
+                    f"{int(english_match.group('year')):04d}-{month:02d}-{int(english_match.group('day')):02d}"
+                )
+                continue
+
+        german_match = re.match(
+            r"^(?:[A-Za-zÄÖÜäöüß]+\s+)?(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÄÖÜäöüß]+)$",
+            normalized,
+        )
+        if german_match:
+            month_key = german_match.group("month").lower()
+            month = german_months.get(month_key)
+            if month:
+                normalized_dates.add(
+                    f"{inferred_year:04d}-{month:02d}-{int(german_match.group('day')):02d}"
+                )
+                continue
+
+        fallback_labels.add(label)
+
+    if normalized_dates:
+        return len(normalized_dates.union(fallback_labels)) or None
+
+    return len(set(raw_labels)) or None
+
+
 def load_openai_api_key():
     return os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -339,9 +409,13 @@ def money(value):
     return str(value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
 
-def make_city_url(city):
+def format_meta_label(key):
+    return key.replace("_", " ").title()
+
+
+def make_city_url(city, contract):
     city_id = CITY_IDS[city.lower()]
-    return f"https://urbansportsclub.com/de/venues?city_id={city_id}&plan_type=2&type%5B%5D=onsite"
+    return crawler.build_search_url(city_id, contract.lower())
 
 
 def get_summary_cache_path(data_path):
@@ -358,6 +432,9 @@ def load_summary_cache(data_path, embeddings_path):
         with cache_path.open("r", encoding="utf-8") as f:
             cached = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return None
+
+    if cached.get("schema_version") != SUMMARY_SCHEMA_VERSION:
         return None
 
     data_file = Path(data_path)
@@ -380,6 +457,7 @@ def save_summary_cache(data_path, embeddings_path, summary):
     data_file = Path(data_path)
     embeddings_file = Path(embeddings_path)
     payload = {
+        "schema_version": SUMMARY_SCHEMA_VERSION,
         "data_mtime": data_file.stat().st_mtime if data_file.exists() else None,
         "embeddings_mtime": embeddings_file.stat().st_mtime if embeddings_file.exists() else None,
         "summary": summary,
@@ -401,6 +479,7 @@ def load_dataset_summary(data_path, embeddings_path):
     df = pd.read_csv(path)
     summary = {
         "city": infer_dataset_city(df),
+        "future_days": infer_dataset_days(df),
         "classes": len(df),
         "venues": df["Venue Name"].nunique() if "Venue Name" in df.columns else 0,
         "categories": df["Class Category"].nunique() if "Class Category" in df.columns else 0,
@@ -443,8 +522,8 @@ def load_dataset_summary(data_path, embeddings_path):
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def count_city_venues(city):
-    search_url = make_city_url(city)
+def count_city_venues(city, contract):
+    search_url = make_city_url(city, contract)
     base_params = crawler.parse_url_params(search_url)
     if "page" in base_params:
         del base_params["page"]
@@ -468,17 +547,16 @@ def count_city_venues(city):
     return len(venues)
 
 
-def get_reference_summary(prefer_test_data):
-    for mode in [prefer_test_data, not prefer_test_data]:
-        for candidate in datasets.iter_dataset_configs(mode):
-            summary = load_dataset_summary(candidate["data_path"], candidate["embeddings_path"])
-            if summary:
-                return summary
+def get_reference_summary():
+    for candidate in datasets.iter_dataset_configs(False):
+        summary = load_dataset_summary(candidate["data_path"], candidate["embeddings_path"])
+        if summary:
+            return summary
     return None
 
 
-def estimate_embedding_cost_from_reference(venue_count, prefer_test_data, model="text-embedding-3-small"):
-    reference = get_reference_summary(prefer_test_data)
+def estimate_embedding_cost_from_reference(venue_count, model="text-embedding-3-small"):
+    reference = get_reference_summary()
     if not reference or reference["venues"] == 0:
         return None
 
@@ -497,8 +575,8 @@ def estimate_embedding_cost_from_tokens(token_count, model="text-embedding-3-sma
     return money(total_cost)
 
 
-def find_dataset_for_city(selected_city, use_test_data):
-    preferred = datasets.get_dataset_config(selected_city, use_test_data)
+def find_dataset_for_city(selected_city, selected_contract):
+    preferred = datasets.get_dataset_config(selected_city, False, selected_contract)
     preferred_summary = load_dataset_summary(
         preferred["data_path"],
         preferred["embeddings_path"],
@@ -507,7 +585,20 @@ def find_dataset_for_city(selected_city, use_test_data):
         preferred["summary"] = preferred_summary
         return preferred
 
-    legacy = datasets.get_legacy_dataset_config(use_test_data)
+    legacy_city = datasets.get_legacy_city_dataset_config(selected_city, False, selected_contract)
+    legacy_city_summary = load_dataset_summary(
+        legacy_city["data_path"],
+        legacy_city["embeddings_path"],
+    )
+    if (
+        legacy_city_summary
+        and legacy_city_summary.get("city")
+        and legacy_city_summary["city"].lower() == selected_city.lower()
+    ):
+        legacy_city["summary"] = legacy_city_summary
+        return legacy_city
+
+    legacy = datasets.get_legacy_dataset_config(False)
     legacy_summary = load_dataset_summary(
         legacy["data_path"],
         legacy["embeddings_path"],
@@ -516,6 +607,7 @@ def find_dataset_for_city(selected_city, use_test_data):
         legacy_summary
         and legacy_summary.get("city")
         and legacy_summary["city"].lower() == selected_city.lower()
+        and selected_contract.upper() == "M"
     ):
         legacy["summary"] = legacy_summary
         return legacy
@@ -525,22 +617,20 @@ def find_dataset_for_city(selected_city, use_test_data):
 
 def get_available_datasets():
     available = []
-    for use_test_data in [False, True]:
-        for config in datasets.iter_dataset_configs(use_test_data):
-            summary = load_dataset_summary(config["data_path"], config["embeddings_path"])
-            if summary:
-                available.append(
-                    {
-                        **config,
-                        "use_test_data": use_test_data,
-                        "summary": summary,
-                    }
-                )
+    for config in datasets.iter_dataset_configs(False):
+        summary = load_dataset_summary(config["data_path"], config["embeddings_path"])
+        if summary:
+            available.append(
+                {
+                    **config,
+                    "summary": summary,
+                }
+            )
     return available
 
 
-def choose_dataset(selected_city, prefer_test_data):
-    dataset_config = find_dataset_for_city(selected_city, prefer_test_data)
+def choose_dataset(selected_city, selected_contract):
+    dataset_config = find_dataset_for_city(selected_city, selected_contract)
     dataset_summary = dataset_config.get("summary") or load_dataset_summary(
         dataset_config["data_path"],
         dataset_config["embeddings_path"],
@@ -553,7 +643,7 @@ def choose_dataset(selected_city, prefer_test_data):
         return (
             dataset_config,
             dataset_summary,
-            f"Using the legacy {dataset_config['label'].lower()} dataset for {selected_city}. A new crawl will store future runs in a city-specific folder.",
+            f"Using the legacy {dataset_config['label'].lower()} dataset for {selected_city} ({selected_contract.upper()}). A new crawl will store future runs in a city-and-contract-specific folder.",
         )
 
     return dataset_config, dataset_summary, None
@@ -679,6 +769,220 @@ def build_result_groups(documents):
     return sorted(grouped.values(), key=lambda item: (item["venue_name"].lower(), len(item["classes"])))
 
 
+def build_crawl_command(city, contract, days):
+    if os.path.exists("/.dockerenv"):
+        python_exec = "python"
+    else:
+        python_exec = ".venv/bin/python" if os.path.exists(".venv/bin/python") else "python3"
+
+    return [python_exec, "-u", "main.py", "--city", city, "--contract", contract.lower(), "--days", str(days)]
+
+
+def get_crawl_job_log_paths(job_id):
+    job_dir = CRAWL_JOB_LOG_DIR / job_id
+    return {
+        "job_dir": job_dir,
+        "log_path": job_dir / "crawl.log",
+        "status_path": job_dir / "exit_code.txt",
+    }
+
+
+def start_crawl_job(city, contract, days):
+    job_id = f"{int(time.time())}-{datasets.slugify_city(city)}-{contract.lower()}"
+    paths = get_crawl_job_log_paths(job_id)
+    paths["job_dir"].mkdir(parents=True, exist_ok=True)
+    cmd = build_crawl_command(city, contract, days)
+    quoted_cmd = " ".join(shlex.quote(part) for part in cmd)
+    shell_cmd = (
+        f"{quoted_cmd} > {shlex.quote(str(paths['log_path']))} 2>&1; "
+        f"printf '%s' $? > {shlex.quote(str(paths['status_path']))}"
+    )
+    process = subprocess.Popen(
+        ["bash", "-lc", shell_cmd],
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
+    )
+
+    return {
+        "id": job_id,
+        "pid": process.pid,
+        "city": city,
+        "contract": contract.upper(),
+        "days": days,
+        "started_at": time.time(),
+        "cmd": cmd,
+        "log_path": str(paths["log_path"]),
+        "status_path": str(paths["status_path"]),
+    }
+
+
+def read_crawl_logs(job, tail=80):
+    if not job:
+        return []
+
+    log_path = Path(job["log_path"])
+    if not log_path.exists():
+        return []
+
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:]
+    except OSError:
+        return []
+
+
+def get_process_running(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def get_crawl_progress_state(logs, city, contract):
+    progress = 0.0
+    text = f"Preparing crawl for {city} ({contract})..."
+    status_message = None
+
+    for raw_line in logs:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "=== USC Venue & Class Scraper ===" in line:
+            progress = max(progress, 0.03)
+            text = f"Starting crawl for {city} ({contract})..."
+            continue
+        if "Targeting city:" in line:
+            progress = max(progress, 0.07)
+            text = f"Targeting {city} ({contract})..."
+            status_message = line
+            continue
+        if "Starting URL discovery" in line:
+            progress = max(progress, 0.12)
+            text = f"Discovering venues for {city} ({contract})..."
+            continue
+
+        class_worker_match = re.search(
+            r"Starting class discovery.*using (\d+) parallel workers",
+            line,
+            re.IGNORECASE,
+        )
+        if class_worker_match:
+            workers = int(class_worker_match.group(1))
+            progress = max(progress, 0.27)
+            text = f"Discovering classes for {city} ({contract}) with {workers} workers..."
+            status_message = f"Class discovery is running with {workers} parallel workers."
+            continue
+
+        venue_match = re.search(r"Venue discovery complete\. Found (\d+) unique venues\.", line)
+        if venue_match:
+            venue_count = int(venue_match.group(1))
+            progress = max(progress, 0.25)
+            text = f"Discovered {venue_count} venues for {city} ({contract})."
+            status_message = f"Discovered {venue_count} venues."
+            continue
+
+        class_progress = re.search(r"\[(\d+)/(\d+)\] Processing venue classes", line)
+        if class_progress:
+            current = int(class_progress.group(1))
+            total = int(class_progress.group(2))
+            progress = max(progress, min(0.25 + (current / total) * 0.25, 0.5))
+            text = f"Discovering classes for {city} ({contract}): {current}/{total} venues checked"
+            continue
+
+        class_match = re.search(r"Class discovery complete\. Found (\d+) unique classes\.", line)
+        if class_match:
+            class_count = int(class_match.group(1))
+            progress = max(progress, 0.52)
+            text = f"Discovered {class_count} classes for {city} ({contract})."
+            status_message = f"Discovered {class_count} classes."
+            continue
+
+        download_match = re.search(r"Downloading (\d+) (venue|class)s to", line)
+        if download_match:
+            count = int(download_match.group(1))
+            kind = download_match.group(2)
+            progress = max(progress, 0.6 if kind == "venue" else 0.72)
+            text = f"Downloading {count} {kind}s for {city} ({contract})..."
+            continue
+
+        if "Successfully wrote" in line and "joined class entries" in line:
+            progress = max(progress, 0.9)
+            text = f"Saving crawl results for {city} ({contract})..."
+            continue
+        if "Cleaning up temporary files" in line:
+            progress = max(progress, 0.96)
+            text = f"Cleaning up crawl temp files for {city} ({contract})..."
+            continue
+        if "=== Done in" in line:
+            progress = 1.0
+            text = f"Crawl finished for {city} ({contract})."
+            status_message = line
+
+    return progress, text, status_message
+
+
+def get_crawl_job_status(job):
+    if not job:
+        return None
+
+    logs = read_crawl_logs(job)
+    progress, text, status_message = get_crawl_progress_state(logs, job["city"], job["contract"])
+    status_path = Path(job["status_path"])
+
+    if status_path.exists():
+        try:
+            return_code = int(status_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return_code = 1
+        state = "complete" if return_code == 0 else "error"
+        if return_code == 0:
+            progress = 1.0
+            text = f"Crawl finished for {job['city']} ({job['contract']})."
+        else:
+            text = f"Crawl failed for {job['city']} ({job['contract']})."
+        return {
+            "state": state,
+            "return_code": return_code,
+            "logs": logs,
+            "progress": progress,
+            "text": text,
+            "status_message": status_message,
+        }
+
+    if get_process_running(job["pid"]):
+        return {
+            "state": "running",
+            "return_code": None,
+            "logs": logs,
+            "progress": progress,
+            "text": text,
+            "status_message": status_message,
+        }
+
+    return {
+        "state": "stopped",
+        "return_code": None,
+        "logs": logs,
+        "progress": progress,
+        "text": f"Crawl stopped for {job['city']} ({job['contract']}).",
+        "status_message": "The crawl process is no longer running.",
+    }
+
+
+def stop_crawl_job(job):
+    if not job:
+        return False
+
+    try:
+        os.killpg(job["pid"], signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
 def render_result_groups(answer_text, grouped_results):
     if not grouped_results:
         return
@@ -713,29 +1017,29 @@ def render_result_groups(answer_text, grouped_results):
                 meta_parts.append(class_item["category"])
             class_box.caption(" · ".join(meta_parts))
             class_box.write(class_item["description"] or "No description available.")
-def run_crawler(city, days, use_test_data):
+def run_crawler(city, contract, days, use_test_data):
     if os.path.exists("/.dockerenv"):
         python_exec = "python"
     else:
         python_exec = ".venv/bin/python" if os.path.exists(".venv/bin/python") else "python3"
 
-    cmd = [python_exec, "-u", "main.py", "--city", city, "--days", str(days)]
+    cmd = [python_exec, "-u", "main.py", "--city", city, "--contract", contract.lower(), "--days", str(days)]
     if use_test_data:
         cmd.append("--test")
     return subprocess.run(cmd, capture_output=True, text=True, check=True)
 
 
-def run_crawler_with_progress(city, days, use_test_data):
+def run_crawler_with_progress(city, contract, days, use_test_data):
     if os.path.exists("/.dockerenv"):
         python_exec = "python"
     else:
         python_exec = ".venv/bin/python" if os.path.exists(".venv/bin/python") else "python3"
 
-    cmd = [python_exec, "-u", "main.py", "--city", city, "--days", str(days)]
+    cmd = [python_exec, "-u", "main.py", "--city", city, "--contract", contract.lower(), "--days", str(days)]
     if use_test_data:
         cmd.append("--test")
 
-    progress_bar = st.progress(0, text=f"Preparing crawl for {city}...")
+    progress_bar = st.progress(0, text=f"Preparing crawl for {city} ({contract})...")
     status = st.empty()
     log_block = st.empty()
     logs = []
@@ -758,14 +1062,14 @@ def run_crawler_with_progress(city, days, use_test_data):
         log_block.code("\n".join(logs[-25:]))
 
         if "=== USC Venue & Class Scraper ===" in line:
-            progress_bar.progress(0.03, text=f"Starting crawl for {city}...")
+            progress_bar.progress(0.03, text=f"Starting crawl for {city} ({contract})...")
             continue
         if "Targeting city:" in line:
             status.info(line)
-            progress_bar.progress(0.07, text=f"Targeting {city}...")
+            progress_bar.progress(0.07, text=f"Targeting {city} ({contract})...")
             continue
         if "Starting URL discovery" in line:
-            progress_bar.progress(0.12, text=f"Discovering venues for {city}...")
+            progress_bar.progress(0.12, text=f"Discovering venues for {city} ({contract})...")
             continue
 
         class_worker_match = re.search(
@@ -776,14 +1080,14 @@ def run_crawler_with_progress(city, days, use_test_data):
         if class_worker_match:
             workers = int(class_worker_match.group(1))
             status.info(f"Class discovery is running with {workers} parallel workers.")
-            progress_bar.progress(0.27, text=f"Discovering classes for {city} with {workers} workers...")
+            progress_bar.progress(0.27, text=f"Discovering classes for {city} ({contract}) with {workers} workers...")
             continue
 
         venue_match = re.search(r"Venue discovery complete\. Found (\d+) unique venues\.", line)
         if venue_match:
             venue_count = int(venue_match.group(1))
             status.info(f"Discovered {venue_count} venues.")
-            progress_bar.progress(0.25, text=f"Discovered {venue_count} venues for {city}.")
+            progress_bar.progress(0.25, text=f"Discovered {venue_count} venues for {city} ({contract}).")
             continue
 
         class_progress = re.search(r"\[(\d+)/(\d+)\] Processing venue classes", line)
@@ -793,7 +1097,7 @@ def run_crawler_with_progress(city, days, use_test_data):
             progress = 0.25 + (current / total) * 0.25
             progress_bar.progress(
                 min(progress, 0.5),
-                text=f"Discovering classes for {city}: {current}/{total} venues checked",
+                text=f"Discovering classes for {city} ({contract}): {current}/{total} venues checked",
             )
             continue
 
@@ -801,7 +1105,7 @@ def run_crawler_with_progress(city, days, use_test_data):
         if class_match:
             class_count = int(class_match.group(1))
             status.info(f"Discovered {class_count} classes.")
-            progress_bar.progress(0.52, text=f"Discovered {class_count} classes for {city}.")
+            progress_bar.progress(0.52, text=f"Discovered {class_count} classes for {city} ({contract}).")
             continue
 
         download_match = re.search(r"Downloading (\d+) (venue|class)s to", line)
@@ -809,7 +1113,7 @@ def run_crawler_with_progress(city, days, use_test_data):
             count = int(download_match.group(1))
             kind = download_match.group(2)
             progress = 0.6 if kind == "venue" else 0.72
-            progress_bar.progress(progress, text=f"Downloading {count} {kind}s for {city}...")
+            progress_bar.progress(progress, text=f"Downloading {count} {kind}s for {city} ({contract})...")
             continue
 
         download_worker_match = re.search(
@@ -824,13 +1128,13 @@ def run_crawler_with_progress(city, days, use_test_data):
             continue
 
         if "Successfully wrote" in line and "joined class entries" in line:
-            progress_bar.progress(0.9, text=f"Saving crawl results for {city}...")
+            progress_bar.progress(0.9, text=f"Saving crawl results for {city} ({contract})...")
             continue
         if "Cleaning up temporary files" in line:
-            progress_bar.progress(0.96, text=f"Cleaning up crawl temp files for {city}...")
+            progress_bar.progress(0.96, text=f"Cleaning up crawl temp files for {city} ({contract})...")
             continue
         if "=== Done in" in line:
-            progress_bar.progress(1.0, text=f"Crawl finished for {city}.")
+            progress_bar.progress(1.0, text=f"Crawl finished for {city} ({contract}).")
             status.success(line)
             continue
 
@@ -842,7 +1146,7 @@ def run_crawler_with_progress(city, days, use_test_data):
         status.empty()
         raise subprocess.CalledProcessError(return_code, cmd, output=combined_output)
 
-    progress_bar.progress(1.0, text=f"Crawl finished for {city}.")
+    progress_bar.progress(1.0, text=f"Crawl finished for {city} ({contract}).")
     status.success("Crawl completed successfully.")
     return combined_output
 
@@ -961,6 +1265,10 @@ if "use_test_dataset" not in st.session_state:
     st.session_state.use_test_dataset = False
 if "selected_city" not in st.session_state:
     st.session_state.selected_city = "Köln"
+if "selected_contract" not in st.session_state:
+    st.session_state.selected_contract = "M"
+if "crawl_job" not in st.session_state:
+    st.session_state.crawl_job = None
 if st.session_state.get("ui_state_version") != UI_STATE_VERSION:
     st.session_state["ui_state_version"] = UI_STATE_VERSION
     st.session_state["messages"] = []
@@ -983,7 +1291,7 @@ if use_test_dataset != st.session_state.use_test_dataset:
 
 st.sidebar.caption(f"API Key: {mask_api_key(load_openai_api_key())}")
 
-top_left, top_right = st.columns([3, 1])
+top_left, top_middle, top_right = st.columns([3, 2, 1])
 with top_left:
     selected_city = st.selectbox(
         "Choose a city",
@@ -991,24 +1299,61 @@ with top_left:
         index=CITY_OPTIONS.index(st.session_state.selected_city),
         help="This is the main entry point: pick the city you want to explore or crawl.",
     )
+with top_middle:
+    selected_contract = st.selectbox(
+        "Contract",
+        CONTRACT_OPTIONS,
+        index=CONTRACT_OPTIONS.index(st.session_state.selected_contract),
+        help="Only crawl and load results for the selected USC contract tier.",
+    )
 with top_right:
-    crawl_days = st.number_input("Days", min_value=1, max_value=30, value=14, step=1)
+    crawl_days = st.number_input(
+        "Next Crawl Days",
+        min_value=1,
+        max_value=30,
+        value=14,
+        step=1,
+        help="This only affects the next crawl you start. The current dataset's actual day span is shown in Dataset Overview as Future Days.",
+    )
 
-if selected_city != st.session_state.selected_city:
+if (
+    selected_city != st.session_state.selected_city
+    or selected_contract != st.session_state.selected_contract
+):
     st.session_state.selected_city = selected_city
+    st.session_state.selected_contract = selected_contract
     st.session_state.messages = []
     st.rerun()
 
 dataset_config, dataset_summary, dataset_notice = choose_dataset(
     selected_city,
+    selected_contract,
     st.session_state.use_test_dataset,
 )
 data_path = dataset_config["data_path"]
 embeddings_path = dataset_config["embeddings_path"]
+crawl_job = st.session_state.get("crawl_job")
+crawl_status = get_crawl_job_status(crawl_job)
+has_running_crawl = bool(crawl_status and crawl_status["state"] == "running")
+
+if crawl_job and crawl_status and crawl_status["state"] != "running" and not crawl_job.get("finalized"):
+    load_dataset_summary.clear()
+    load_rag_chain.clear()
+    count_city_venues.clear()
+    crawl_job["finalized"] = True
+    st.session_state.crawl_job = crawl_job
+    dataset_config, dataset_summary, dataset_notice = choose_dataset(
+        selected_city,
+        selected_contract,
+        st.session_state.use_test_dataset,
+    )
+    data_path = dataset_config["data_path"]
+    embeddings_path = dataset_config["embeddings_path"]
 
 st.sidebar.info(
     f"{dataset_config['label']} dataset: "
-    f"{(dataset_summary or {}).get('city') or 'Unavailable'} · "
+    f"{(dataset_summary or {}).get('city') or selected_city} · "
+    f"{dataset_config.get('contract', selected_contract)} · "
     f"{(dataset_summary or {}).get('classes', 0)} classes · "
     f"{(dataset_summary or {}).get('venues', 0)} venues"
 )
@@ -1020,8 +1365,49 @@ dataset_matches_selected_city = bool(
 if dataset_notice:
     st.info(dataset_notice)
 
+if crawl_job and crawl_status:
+    with st.container(border=True):
+        st.markdown("#### Crawl Job")
+        st.caption(
+            f"{crawl_job['city']} · {crawl_job['contract']} · {crawl_job['days']} days · "
+            f"{'Test' if crawl_job['use_test_data'] else 'Production'}"
+        )
+        st.progress(crawl_status["progress"], text=crawl_status["text"])
+        if crawl_status.get("status_message"):
+            if crawl_status["state"] == "error":
+                st.error(crawl_status["status_message"])
+            elif crawl_status["state"] == "complete":
+                st.success(crawl_status["status_message"])
+            else:
+                st.info(crawl_status["status_message"])
+
+        crawl_actions = st.columns(2)
+        with crawl_actions[0]:
+            if crawl_status["state"] == "running":
+                if st.button("Stop Crawling", type="secondary", use_container_width=True):
+                    if stop_crawl_job(crawl_job):
+                        st.warning("Stopping crawl job...")
+                        time.sleep(1)
+                        st.rerun()
+                    st.error("Unable to stop crawl job.")
+            else:
+                if st.button("Clear Crawl Status", use_container_width=True):
+                    st.session_state.crawl_job = None
+                    st.rerun()
+        with crawl_actions[1]:
+            state_label = {
+                "running": "Running",
+                "complete": "Completed",
+                "error": "Failed",
+                "stopped": "Stopped",
+            }.get(crawl_status["state"], "Unknown")
+            st.metric("Job State", state_label)
+
+        with st.expander("Crawler Logs", expanded=crawl_status["state"] != "running"):
+            st.code("\n".join(crawl_status["logs"][-40:]) or "No crawl logs yet.")
+
 if dataset_matches_selected_city:
-    st.success(f"Dataset available for {selected_city}.")
+    st.success(f"Dataset available for {selected_city} ({selected_contract}).")
     stats = st.columns(5)
     stats[0].metric("Classes", f"{dataset_summary['classes']:,}")
     stats[1].metric("Venues", f"{dataset_summary['venues']:,}")
@@ -1034,52 +1420,48 @@ if dataset_matches_selected_city:
     )
     stats[4].metric("Embedding Size", embedding_dim_label)
 
-    dataset_rows = [
+    overview_rows = [
         ("Mode", dataset_config["label"]),
-        ("Dataset File", data_path),
+        ("Contract", dataset_config.get("contract", selected_contract)),
+        ("City", dataset_summary["city"] or selected_city),
+        ("Future Days", dataset_summary.get("future_days") or "Unknown"),
+        ("Categories", dataset_summary["categories"]),
         ("CSV Size", dataset_summary["data_size"]),
         ("Updated", dataset_summary["data_updated"]),
-    ]
-    embedding_rows = [
-        ("Embeddings File", embeddings_path if dataset_summary["embedding_size"] else "Not generated yet"),
-        ("File Size", dataset_summary["embedding_size"] or "Not generated yet"),
+        ("Embeddings", "Ready" if dataset_summary["embedding_size"] else "Missing"),
+        ("Embedding File Size", dataset_summary["embedding_size"] or "Not generated yet"),
+        ("Embedding Updated", dataset_summary["embedding_updated"] or "Not generated yet"),
         ("Vector Size", f"{dataset_summary['embedding_dims']} dimensions" if dataset_summary["embedding_dims"] else "Not generated yet"),
+        ("Dataset File", data_path),
+        ("Embeddings File", embeddings_path),
     ]
-    if dataset_summary["embedding_updated"]:
-        embedding_rows.insert(3, ("Updated", dataset_summary["embedding_updated"]))
 
-    col_dataset, col_embeddings = st.columns(2)
-    with col_dataset:
-        panel = st.container(border=True)
-        panel.markdown("#### Dataset Overview est")
-        for label, value in dataset_rows:
-            lcol, rcol = panel.columns([1, 2])
-            lcol.caption(label)
-            rcol.markdown(f"**{value}**")
-    with col_embeddings:
-        panel = st.container(border=True)
-        panel.markdown("#### Embeddings")
-        for label, value in embedding_rows:
-            lcol, rcol = panel.columns([1, 2])
-            lcol.caption(label)
-            rcol.markdown(f"**{value}**")
+    panel = st.container(border=True)
+    panel.markdown("#### Dataset Overview")
+    info_cols = panel.columns(2)
+    half = (len(overview_rows) + 1) // 2
+    for idx, (label, value) in enumerate(overview_rows):
+        target_col = info_cols[0] if idx < half else info_cols[1]
+        row = target_col.container()
+        lcol, rcol = row.columns([1, 2])
+        lcol.caption(label)
+        rcol.markdown(f"**{value}**")
 
     action_left, action_right = st.columns([1, 1])
     with action_left:
-        if st.button("Recrawl This City", type="secondary", use_container_width=True):
+        if has_running_crawl:
+            st.info("A crawl is already running. Stop it before starting another one.")
+        elif st.button("Recrawl This City", type="secondary", use_container_width=True):
             try:
-                logs = run_crawler_with_progress(selected_city, crawl_days, st.session_state.use_test_dataset)
-                load_dataset_summary.clear()
-                load_rag_chain.clear()
-                count_city_venues.clear()
-                st.success("Crawl completed successfully.")
-                with st.expander("Crawler Logs"):
-                    st.code(logs)
-                time.sleep(1)
+                st.session_state.crawl_job = start_crawl_job(
+                    selected_city,
+                    selected_contract,
+                    crawl_days,
+                    st.session_state.use_test_dataset,
+                )
                 st.rerun()
-            except subprocess.CalledProcessError as e:
-                st.error("Crawler failed.")
-                st.code(e.stderr or e.stdout)
+            except Exception as e:
+                st.error(f"Unable to start crawler: {e}")
     with action_right:
         estimated_embedding_cost = estimate_embedding_cost_from_tokens(dataset_summary["token_count"])
         status_label = "Embeddings Ready" if dataset_summary["embedding_size"] else "Embeddings Missing"
@@ -1107,7 +1489,7 @@ if dataset_matches_selected_city:
                 "Semantic Search is ready to use." if dataset_summary["embedding_size"] else "Create embeddings to unlock fast semantic search."
             )
             status_label = "Embeddings Ready" if dataset_summary["embedding_size"] else "Embeddings Missing"
-            st.status(status_label, state="complete" if dataset_summary["embedding_size"] else "warning")
+            st.status(status_label, state="complete" if dataset_summary["embedding_size"] else "running")
             if dataset_summary["embedding_size"]:
                 st.caption(f"Estimated embedding cost (current dataset): ${estimated_embedding_cost}")
             button_label = "Create Embeddings" if not dataset_summary["embedding_size"] else "Recreate Embeddings"
@@ -1127,17 +1509,21 @@ if dataset_matches_selected_city:
                     st.error("Embedding generation failed.")
                     st.code(e.stderr or e.stdout)
 else:
-    st.warning(f"Attention: no saved dataset is available for {selected_city} yet.")
+    st.warning(f"Attention: no saved dataset is available for {selected_city} ({selected_contract}) yet.")
 
     estimate_col, start_col = st.columns([1, 1])
     with estimate_col:
         if st.button("Estimate Crawl Scope", type="primary", use_container_width=True):
             st.session_state["crawl_estimate_city"] = selected_city
+            st.session_state["crawl_estimate_contract"] = selected_contract
 
-    estimate_ready = st.session_state.get("crawl_estimate_city") == selected_city
+    estimate_ready = (
+        st.session_state.get("crawl_estimate_city") == selected_city
+        and st.session_state.get("crawl_estimate_contract") == selected_contract
+    )
     if estimate_ready:
-        with st.spinner(f"Checking USC venue count for {selected_city}..."):
-            venue_count = count_city_venues(selected_city)
+        with st.spinner(f"Checking USC venue count for {selected_city} ({selected_contract})..."):
+            venue_count = count_city_venues(selected_city, selected_contract)
             cost_estimate = estimate_embedding_cost_from_reference(
                 venue_count,
                 st.session_state.use_test_dataset,
@@ -1158,20 +1544,19 @@ else:
             st.caption("Create one reference dataset first to enable price estimates.")
 
         with start_col:
-            if st.button("Start Crawling", type="primary", use_container_width=True):
+            if has_running_crawl:
+                st.info("A crawl is already running. Stop it before starting another one.")
+            elif st.button("Start Crawling", type="primary", use_container_width=True):
                 try:
-                    logs = run_crawler_with_progress(selected_city, crawl_days, st.session_state.use_test_dataset)
-                    load_dataset_summary.clear()
-                    load_rag_chain.clear()
-                    count_city_venues.clear()
-                    st.success("Crawl completed successfully.")
-                    with st.expander("Crawler Logs"):
-                        st.code(logs)
-                    time.sleep(1)
+                    st.session_state.crawl_job = start_crawl_job(
+                        selected_city,
+                        selected_contract,
+                        crawl_days,
+                        st.session_state.use_test_dataset,
+                    )
                     st.rerun()
-                except subprocess.CalledProcessError as e:
-                    st.error("Crawler failed.")
-                    st.code(e.stderr or e.stdout)
+                except Exception as e:
+                    st.error(f"Unable to start crawler: {e}")
     else:
         st.info("Estimate the crawl first to see venue count and expected embedding spend.")
 
@@ -1200,7 +1585,7 @@ if dataset_matches_selected_city:
             else:
                 st.markdown(message["content"])
 
-    if prompt := st.chat_input(f"E.g., Which yoga classes are available tomorrow evening in {selected_city}?"):
+    if prompt := st.chat_input(f"E.g., Which yoga classes are available tomorrow evening in {selected_city} for {selected_contract}?"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
@@ -1225,3 +1610,7 @@ if dataset_matches_selected_city:
                         st.error(f"Chat error generated: {e}")
 else:
     st.info("No local dataset is available for this city yet. Start a crawl above to unlock chat.")
+
+if has_running_crawl:
+    time.sleep(2)
+    st.rerun()

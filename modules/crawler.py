@@ -7,6 +7,12 @@ import sys
 import concurrent.futures
 
 CLASS_DISCOVERY_WORKERS = 15
+CONTRACT_PLAN_TYPES = {
+    "s": 1,
+    "m": 2,
+    "l": 3,
+    "xl": 4,
+}
 
 def fetch_page(page_num, base_params=None):
     base_url = "https://urbansportsclub.com/de/venues"
@@ -62,6 +68,14 @@ def parse_url_params(url):
              clean_params[key] = value
              
     return clean_params
+
+
+def build_search_url(city_id, contract="m"):
+    plan_type = CONTRACT_PLAN_TYPES[contract.lower()]
+    return (
+        "https://urbansportsclub.com/de/venues"
+        f"?city_id={city_id}&plan_type={plan_type}&type%5B%5D=onsite"
+    )
 
 from datetime import datetime, timedelta
 
