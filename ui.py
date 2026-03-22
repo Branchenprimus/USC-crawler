@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
+from collections import defaultdict
 
 import pandas as pd
 import streamlit as st
@@ -66,6 +67,11 @@ CHAT_MODEL = "gpt-4o"
 UI_STATE_VERSION = "venue-tiles-v1"
 CRAWL_JOB_LOG_DIR = Path(".crawler_jobs")
 SUMMARY_SCHEMA_VERSION = 2
+VECTOR_SEARCH_K = 30
+KEYWORD_RESULT_LIMIT = 120
+COMPLETE_RESULT_LIMIT = 400
+MAX_CONTEXT_VENUES = 40
+MAX_CONTEXT_CLASSES_PER_VENUE = 8
 
 
 st.title("USC Venue Explorer")
@@ -575,6 +581,308 @@ def estimate_embedding_cost_from_tokens(token_count, model="text-embedding-3-sma
     return money(total_cost)
 
 
+def _normalize_search_text(value):
+    text = str(value or "").strip().lower()
+    replacements = {
+        "ä": "ae",
+        "ö": "oe",
+        "ü": "ue",
+        "ß": "ss",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return re.sub(r"\s+", " ", text)
+
+
+def _source_record_from_doc(doc):
+    source = doc.metadata.get("source") if isinstance(doc.metadata, dict) else None
+    return source if isinstance(source, dict) else None
+
+
+def _get_keyword_variants(term):
+    variants = {term.lower(), _normalize_search_text(term)}
+    synonym_map = {
+        "tischtennis": {"table tennis"},
+        "table tennis": {"tischtennis"},
+        "fussball": {"fußball", "football", "soccer"},
+        "fußball": {"fussball", "football", "soccer"},
+        "yoga": {"yoga"},
+        "pilates": {"pilates"},
+        "padel": {"padel"},
+        "badminton": {"badminton"},
+        "squash": {"squash"},
+    }
+    for variant in list(variants):
+        variants.update(synonym_map.get(variant, set()))
+    return {_normalize_search_text(variant) for variant in variants if variant}
+
+
+def extract_query_terms(user_input):
+    raw_terms = re.findall(r"[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-]{2,}", user_input.lower())
+    stop_words = {
+        "welche", "which", "what", "gibt", "there", "thereare", "sind", "with",
+        "have", "show", "zeige", "find", "suche", "classes", "class", "venues",
+        "venue", "locations", "location", "available", "tomorrow", "today",
+        "morgen", "heute", "evening", "abend", "und", "the", "for", "are", "ich",
+        "know", "that", "there", "some", "all", "whole", "complete", "answers",
+        "where", "kann", "can", "list", "near", "mir", "bitte", "give", "zeigen",
+        "berlin", "munchen", "muenchen", "hamburg", "frankfurt", "stuttgart",
+        "koeln", "koln", "cologne", "duesseldorf", "dusseldorf", "leipzig",
+        "hannover", "nurnberg", "nuernberg", "bonn", "bremen",
+    }
+    terms = []
+    seen = set()
+    for term in raw_terms:
+        normalized_term = _normalize_search_text(term)
+        if normalized_term in stop_words:
+            continue
+        for variant in sorted(_get_keyword_variants(term)):
+            if variant not in seen:
+                seen.add(variant)
+                terms.append(variant)
+    return terms
+
+
+def analyze_query(user_input):
+    normalized = _normalize_search_text(user_input)
+    terms = extract_query_terms(user_input)
+    discovery_markers = (
+        "where can i", "where do", "which venues", "which locations", "where to",
+        "wo kann ich", "welche venues", "welche locations", "zeige mir", "list",
+        "alle", "all", "complete", "vollstaendig", "vollstandig",
+    )
+    time_markers = (
+        "today", "tomorrow", "tonight", "morning", "afternoon", "evening",
+        "heute", "morgen", "abend", "vormittag", "nachmittag", "uhr",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "montag", "dienstag", "mittwoch", "donnerstag", "freitag", "samstag", "sonntag",
+    )
+    class_markers = ("class", "classes", "kurs", "kurse", "schedule", "times", "sessions")
+
+    wants_complete = any(marker in normalized for marker in discovery_markers)
+    wants_time = any(marker in normalized for marker in time_markers)
+    wants_classes = wants_time or any(marker in normalized for marker in class_markers)
+
+    if terms and not wants_time and not wants_classes:
+        wants_complete = True
+
+    mode = "complete_venues" if wants_complete else "hybrid"
+    return {
+        "normalized_query": normalized,
+        "terms": terms,
+        "mode": mode,
+        "wants_complete": wants_complete,
+        "wants_time": wants_time,
+        "wants_classes": wants_classes,
+    }
+
+
+def score_source_record(source, query_analysis):
+    terms = query_analysis["terms"]
+    if not terms:
+        return None
+
+    searchable_fields = {
+        "class_title": _normalize_search_text(source.get("Class Title", "")),
+        "class_category": _normalize_search_text(source.get("Class Category", "")),
+        "class_description": _normalize_search_text(source.get("Class Description", "")),
+        "class_date": _normalize_search_text(source.get("Class Date", "")),
+        "venue_name": _normalize_search_text(source.get("Venue Name", "")),
+        "venue_disciplines": _normalize_search_text(source.get("Venue Disciplines", "")),
+        "venue_address": _normalize_search_text(source.get("Venue Address", "")),
+        "venue_description": _normalize_search_text(source.get("Venue Description", "")),
+        "combined": _normalize_search_text(source.get("Combined_Text", "")),
+    }
+    haystack = " ".join(value for value in searchable_fields.values() if value)
+
+    score = 0
+    matched_terms = set()
+    matched_fields = set()
+    for term in terms:
+        if term not in haystack:
+            continue
+
+        matched_terms.add(term)
+        if term in searchable_fields["venue_disciplines"]:
+            score += 9
+            matched_fields.add("venue_disciplines")
+        if term in searchable_fields["class_category"]:
+            score += 7
+            matched_fields.add("class_category")
+        if term in searchable_fields["class_title"]:
+            score += 7
+            matched_fields.add("class_title")
+        if term in searchable_fields["venue_name"]:
+            score += 6
+            matched_fields.add("venue_name")
+        if term in searchable_fields["venue_description"]:
+            score += 3
+            matched_fields.add("venue_description")
+        if term in searchable_fields["class_description"]:
+            score += 2
+            matched_fields.add("class_description")
+        if term in searchable_fields["class_date"]:
+            score += 2
+            matched_fields.add("class_date")
+        if term in searchable_fields["venue_address"]:
+            score += 1
+            matched_fields.add("venue_address")
+        if term in searchable_fields["combined"]:
+            score += 1
+
+    if not matched_terms:
+        return None
+
+    if len(matched_terms) == len(terms):
+        score += 5
+    score += len(matched_terms) * 2
+
+    return {
+        "score": score,
+        "matched_terms": len(matched_terms),
+        "matched_fields": len(matched_fields),
+    }
+
+
+def keyword_match_documents(documents, user_input, limit=KEYWORD_RESULT_LIMIT):
+    query_analysis = analyze_query(user_input)
+    if not query_analysis["terms"]:
+        return []
+
+    scored = []
+    for doc in documents:
+        source = _source_record_from_doc(doc)
+        if not source:
+            continue
+
+        match = score_source_record(source, query_analysis)
+        if not match:
+            continue
+        scored.append((match["score"], match["matched_terms"], match["matched_fields"], doc))
+
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            -item[2],
+            _normalize_search_text(_source_record_from_doc(item[3]).get("Venue Name", "")),
+            _normalize_search_text(_source_record_from_doc(item[3]).get("Class Title", "")),
+            _normalize_search_text(_source_record_from_doc(item[3]).get("Class Date", "")),
+        )
+    )
+    return [doc for _, _, _, doc in scored[:limit]]
+
+
+def merge_documents(primary_docs, secondary_docs, limit=KEYWORD_RESULT_LIMIT):
+    merged = []
+    seen = set()
+    for doc in list(primary_docs) + list(secondary_docs):
+        source = doc.metadata.get("source") if isinstance(doc.metadata, dict) else None
+        if not isinstance(source, dict):
+            continue
+        key = (
+            source.get("Venue Name"),
+            source.get("Class Title"),
+            source.get("Class Date"),
+            source.get("Venue USC URL"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(doc)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def select_complete_venue_documents(documents, query_analysis, limit=COMPLETE_RESULT_LIMIT):
+    if not query_analysis["terms"]:
+        return []
+
+    venue_matches = defaultdict(list)
+    venue_scores = defaultdict(int)
+    for doc in documents:
+        source = _source_record_from_doc(doc)
+        if not source:
+            continue
+
+        match = score_source_record(source, query_analysis)
+        if not match:
+            continue
+
+        venue_name = _clean_value(source.get("Venue Name"), "Unknown Venue")
+        venue_matches[venue_name].append((match, doc))
+        venue_scores[venue_name] += match["score"]
+
+    ordered_documents = []
+    seen = set()
+    sorted_venues = sorted(
+        venue_matches,
+        key=lambda venue_name: (
+            -venue_scores[venue_name],
+            -len(venue_matches[venue_name]),
+            _normalize_search_text(venue_name),
+        ),
+    )
+    for venue_name in sorted_venues:
+        sorted_matches = sorted(
+            venue_matches[venue_name],
+            key=lambda item: (
+                -item[0]["score"],
+                -item[0]["matched_terms"],
+                _normalize_search_text(_source_record_from_doc(item[1]).get("Class Date", "")),
+                _normalize_search_text(_source_record_from_doc(item[1]).get("Class Title", "")),
+            ),
+        )
+        for _, doc in sorted_matches:
+            source = _source_record_from_doc(doc)
+            key = (
+                source.get("Venue Name"),
+                source.get("Class Title"),
+                source.get("Class Date"),
+                source.get("Venue USC URL"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered_documents.append(doc)
+            if len(ordered_documents) >= limit:
+                return ordered_documents
+
+    return ordered_documents
+
+
+def build_context_from_groups(grouped_results, query_analysis):
+    context_lines = []
+    for venue in grouped_results[:MAX_CONTEXT_VENUES]:
+        header = (
+            f"Venue: {venue['venue_name']} | Rating: {venue['rating']} | "
+            f"Disciplines: {venue['disciplines']} | Address: {venue['address']}"
+        )
+        context_lines.append(header)
+        if venue["description"]:
+            context_lines.append(f"Venue description: {venue['description']}")
+
+        for class_item in venue["classes"][:MAX_CONTEXT_CLASSES_PER_VENUE]:
+            context_lines.append(
+                "Class: "
+                f"{class_item['title']} | Date: {class_item['date']} | Category: {class_item['category']}"
+            )
+
+        if len(venue["classes"]) > MAX_CONTEXT_CLASSES_PER_VENUE:
+            context_lines.append(
+                f"Additional matching classes at this venue: {len(venue['classes']) - MAX_CONTEXT_CLASSES_PER_VENUE}"
+            )
+        context_lines.append("")
+
+    intent_hint = (
+        "exhaustive venue discovery"
+        if query_analysis["mode"] == "complete_venues"
+        else "hybrid class and venue retrieval"
+    )
+    return f"Retrieval intent: {intent_hint}\n\n" + "\n".join(context_lines).strip()
+
+
 def find_dataset_for_city(selected_city, selected_contract):
     preferred = datasets.get_dataset_config(selected_city, False, selected_contract)
     preferred_summary = load_dataset_summary(
@@ -651,6 +959,19 @@ def choose_dataset(selected_city, selected_contract):
 
 @st.cache_resource
 def load_rag_chain(data_path, embeddings_path):
+    prompt = ChatPromptTemplate.from_template(
+        """You are an assistant for answering questions about Urban Sports Club venues and classes.
+Use the provided context only.
+If you don't know the answer, just say that you don't know.
+Keep the answer concise and easy to scan.
+If retrieval mode is exhaustive venue discovery, list every matched venue from the context before you mention examples.
+If retrieval mode is schedule search, summarize the most relevant classes and venues without inventing anything.
+Retrieval mode: {retrieval_mode}
+Context: {context}
+Question: {input}
+Answer:"""
+    )
+
     if os.path.exists(embeddings_path):
         with open(embeddings_path, "r", encoding="utf-8") as f:
             records = json.load(f)
@@ -672,19 +993,15 @@ def load_rag_chain(data_path, embeddings_path):
             embedding=embedding_model,
             metadatas=metadatas,
         )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": VECTOR_SEARCH_K})
 
         llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
-        prompt = ChatPromptTemplate.from_template(
-            """You are an assistant for answering questions about Urban Sports Club venues and classes.
-Use the following pieces of retrieved context to answer the question.
-If you don't know the answer, just say that you don't know.
-Keep the answer concise and formatting clear. Structure schedules logically.
-Context: {context}
-Question: {input}
-Answer:"""
-        )
-        return retriever, prompt, llm
+        return {
+            "retriever": retriever,
+            "prompt": prompt,
+            "llm": llm,
+            "documents": documents,
+        }
 
     if not os.path.exists(data_path):
         return None
@@ -693,31 +1010,60 @@ Answer:"""
     if "Combined_Text" not in df.columns:
         return None
 
-    documents = [Document(page_content=str(row), metadata={"source": idx}) for idx, row in df["Combined_Text"].items()]
+    documents = []
+    for _, row in df.iterrows():
+        record = {
+            key: ("" if pd.isna(value) else str(value))
+            for key, value in row.to_dict().items()
+        }
+        combined_text = record.get("Combined_Text", "")
+        if combined_text:
+            documents.append(Document(page_content=combined_text, metadata={"source": record}))
+
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     vectorstore = FAISS.from_documents(documents, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": VECTOR_SEARCH_K})
 
     llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
-    prompt = ChatPromptTemplate.from_template(
-        """You are an assistant for answering questions about Urban Sports Club venues and classes.
-Use the following pieces of retrieved context to answer the question.
-If you don't know the answer, just say that you don't know.
-Keep the answer concise and formatting clear. Structure schedules logically.
-Context: {context}
-Question: {input}
-Answer:"""
-    )
-    return retriever, prompt, llm
+    return {
+        "retriever": retriever,
+        "prompt": prompt,
+        "llm": llm,
+        "documents": documents,
+    }
 
 
 def answer_question(rag_components, user_input):
-    retriever, prompt, llm = rag_components
-    documents = retriever.invoke(user_input)
-    context = "\n\n".join(doc.page_content for doc in documents)
-    messages = prompt.invoke({"context": context, "input": user_input})
+    retriever = rag_components["retriever"]
+    prompt = rag_components["prompt"]
+    llm = rag_components["llm"]
+    all_documents = rag_components["documents"]
+
+    query_analysis = analyze_query(user_input)
+    if query_analysis["mode"] == "complete_venues":
+        complete_documents = select_complete_venue_documents(all_documents, query_analysis)
+        vector_documents = retriever.invoke(user_input)
+        documents = merge_documents(complete_documents, vector_documents, limit=COMPLETE_RESULT_LIMIT)
+    else:
+        vector_documents = retriever.invoke(user_input)
+        keyword_documents = keyword_match_documents(all_documents, user_input)
+        documents = merge_documents(keyword_documents, vector_documents)
+
+    grouped_results = build_result_groups(documents, query_analysis)
+    if query_analysis["mode"] == "complete_venues":
+        context = build_context_from_groups(grouped_results, query_analysis)
+    else:
+        context = "\n\n".join(doc.page_content for doc in documents)
+
+    messages = prompt.invoke(
+        {
+            "context": context,
+            "input": user_input,
+            "retrieval_mode": query_analysis["mode"],
+        }
+    )
     response = llm.invoke(messages)
-    return response.content, documents
+    return response.content, grouped_results
 
 
 def _clean_value(value, fallback="N/A"):
@@ -734,11 +1080,11 @@ def _truncate_text(text, limit=180):
     return f"{text[:limit - 1].rstrip()}..."
 
 
-def build_result_groups(documents):
+def build_result_groups(documents, query_analysis=None):
     grouped = {}
     for doc in documents:
-        source = doc.metadata.get("source") if isinstance(doc.metadata, dict) else None
-        if not isinstance(source, dict):
+        source = _source_record_from_doc(doc)
+        if not source:
             continue
 
         venue_name = _clean_value(source.get("Venue Name"), "Unknown Venue")
@@ -766,7 +1112,22 @@ def build_result_groups(documents):
             }
         )
 
-    return sorted(grouped.values(), key=lambda item: (item["venue_name"].lower(), len(item["classes"])))
+    for entry in grouped.values():
+        entry["classes"].sort(
+            key=lambda class_item: (
+                _normalize_search_text(class_item["date"]),
+                _normalize_search_text(class_item["title"]),
+                _normalize_search_text(class_item["category"]),
+            )
+        )
+
+    if query_analysis and query_analysis["mode"] == "complete_venues":
+        return sorted(
+            grouped.values(),
+            key=lambda item: (-len(item["classes"]), _normalize_search_text(item["venue_name"])),
+        )
+
+    return sorted(grouped.values(), key=lambda item: (_normalize_search_text(item["venue_name"]), len(item["classes"])))
 
 
 def build_crawl_command(city, contract, days):
@@ -984,6 +1345,9 @@ def stop_crawl_job(job):
 
 
 def render_result_groups(answer_text, grouped_results):
+    if answer_text:
+        st.markdown(answer_text)
+
     if not grouped_results:
         return
 
@@ -1008,36 +1372,23 @@ def render_result_groups(answer_text, grouped_results):
             if venue.get("usc_url") and venue["usc_url"] != "N/A":
                 card.link_button("Open on USC", venue["usc_url"])
 
-        card.caption(f"{len(venue['classes'])} matching classes")
-        for class_item in venue["classes"]:
-            class_box = card.container()
-            class_box.markdown(f"**{class_item['title']}**")
-            meta_parts = [class_item["date"]]
-            if class_item["category"] != "N/A":
-                meta_parts.append(class_item["category"])
-            class_box.caption(" · ".join(meta_parts))
-            class_box.write(class_item["description"] or "No description available.")
-def run_crawler(city, contract, days, use_test_data):
+        class_count = len(venue["classes"])
+        with card.expander(f"{class_count} matching classes", expanded=False):
+            for class_item in venue["classes"]:
+                class_box = st.container()
+                class_box.markdown(f"**{class_item['title']}**")
+                meta_parts = [class_item["date"]]
+                if class_item["category"] != "N/A":
+                    meta_parts.append(class_item["category"])
+                class_box.caption(" · ".join(meta_parts))
+                class_box.write(class_item["description"] or "No description available.")
+def run_crawler_with_progress(city, contract, days):
     if os.path.exists("/.dockerenv"):
         python_exec = "python"
     else:
         python_exec = ".venv/bin/python" if os.path.exists(".venv/bin/python") else "python3"
 
     cmd = [python_exec, "-u", "main.py", "--city", city, "--contract", contract.lower(), "--days", str(days)]
-    if use_test_data:
-        cmd.append("--test")
-    return subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-
-def run_crawler_with_progress(city, contract, days, use_test_data):
-    if os.path.exists("/.dockerenv"):
-        python_exec = "python"
-    else:
-        python_exec = ".venv/bin/python" if os.path.exists(".venv/bin/python") else "python3"
-
-    cmd = [python_exec, "-u", "main.py", "--city", city, "--contract", contract.lower(), "--days", str(days)]
-    if use_test_data:
-        cmd.append("--test")
 
     progress_bar = st.progress(0, text=f"Preparing crawl for {city} ({contract})...")
     status = st.empty()
@@ -1261,8 +1612,6 @@ def ai_settings_dialog():
             st.rerun()
 
 
-if "use_test_dataset" not in st.session_state:
-    st.session_state.use_test_dataset = False
 if "selected_city" not in st.session_state:
     st.session_state.selected_city = "Köln"
 if "selected_contract" not in st.session_state:
@@ -1273,25 +1622,7 @@ if st.session_state.get("ui_state_version") != UI_STATE_VERSION:
     st.session_state["ui_state_version"] = UI_STATE_VERSION
     st.session_state["messages"] = []
 
-sidebar_left, sidebar_right = st.sidebar.columns(2)
-with sidebar_left:
-    use_test_dataset = st.toggle(
-        "Test mode",
-        value=st.session_state.use_test_dataset,
-        help="Switch the whole UI into test mode: use the test dataset and run crawls with the --test flag.",
-    )
-with sidebar_right:
-    if st.button("AI Settings", use_container_width=True):
-        ai_settings_dialog()
-
-if use_test_dataset != st.session_state.use_test_dataset:
-    st.session_state.use_test_dataset = use_test_dataset
-    load_rag_chain.clear()
-    st.rerun()
-
-st.sidebar.caption(f"API Key: {mask_api_key(load_openai_api_key())}")
-
-top_left, top_middle, top_right = st.columns([3, 2, 1])
+top_left, top_middle, top_right, top_settings = st.columns([3, 2, 1, 1])
 with top_left:
     selected_city = st.selectbox(
         "Choose a city",
@@ -1315,6 +1646,10 @@ with top_right:
         step=1,
         help="This only affects the next crawl you start. The current dataset's actual day span is shown in Dataset Overview as Future Days.",
     )
+with top_settings:
+    st.write("")
+    if st.button("⚙ Settings", use_container_width=True):
+        ai_settings_dialog()
 
 if (
     selected_city != st.session_state.selected_city
@@ -1328,7 +1663,6 @@ if (
 dataset_config, dataset_summary, dataset_notice = choose_dataset(
     selected_city,
     selected_contract,
-    st.session_state.use_test_dataset,
 )
 data_path = dataset_config["data_path"]
 embeddings_path = dataset_config["embeddings_path"]
@@ -1345,18 +1679,9 @@ if crawl_job and crawl_status and crawl_status["state"] != "running" and not cra
     dataset_config, dataset_summary, dataset_notice = choose_dataset(
         selected_city,
         selected_contract,
-        st.session_state.use_test_dataset,
     )
     data_path = dataset_config["data_path"]
     embeddings_path = dataset_config["embeddings_path"]
-
-st.sidebar.info(
-    f"{dataset_config['label']} dataset: "
-    f"{(dataset_summary or {}).get('city') or selected_city} · "
-    f"{dataset_config.get('contract', selected_contract)} · "
-    f"{(dataset_summary or {}).get('classes', 0)} classes · "
-    f"{(dataset_summary or {}).get('venues', 0)} venues"
-)
 
 dataset_matches_selected_city = bool(
     dataset_summary and dataset_summary["city"] and dataset_summary["city"].lower() == selected_city.lower()
@@ -1368,10 +1693,7 @@ if dataset_notice:
 if crawl_job and crawl_status:
     with st.container(border=True):
         st.markdown("#### Crawl Job")
-        st.caption(
-            f"{crawl_job['city']} · {crawl_job['contract']} · {crawl_job['days']} days · "
-            f"{'Test' if crawl_job['use_test_data'] else 'Production'}"
-        )
+        st.caption(f"{crawl_job['city']} · {crawl_job['contract']} · {crawl_job['days']} days · Production")
         st.progress(crawl_status["progress"], text=crawl_status["text"])
         if crawl_status.get("status_message"):
             if crawl_status["state"] == "error":
@@ -1457,41 +1779,15 @@ if dataset_matches_selected_city:
                     selected_city,
                     selected_contract,
                     crawl_days,
-                    st.session_state.use_test_dataset,
                 )
                 st.rerun()
             except Exception as e:
                 st.error(f"Unable to start crawler: {e}")
     with action_right:
         estimated_embedding_cost = estimate_embedding_cost_from_tokens(dataset_summary["token_count"])
-        status_label = "Embeddings Ready" if dataset_summary["embedding_size"] else "Embeddings Missing"
-        status_class = "pill-ok" if dataset_summary["embedding_size"] else "pill-missing"
-        action_title = "Semantic Search is ready to use." if dataset_summary["embedding_size"] else "Create embeddings to unlock fast semantic search."
-        st.markdown(
-            f"""
-            <div class="action-shell">
-                <div class="action-topline">
-                    <div>
-                        <div class="action-eyebrow">Embedding Action</div>
-                        <div class="action-title">{html.escape(action_title)}</div>
-                    </div>
-                    <div class="{status_class}">{html.escape(status_label)}</div>
-                </div>
-                <div class="action-caption">Estimated OpenAI embedding cost for the active dataset: ${html.escape(estimated_embedding_cost)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
         with st.container(border=True):
-            st.caption("Embedding Action")
-            st.markdown(
-                "Semantic Search is ready to use." if dataset_summary["embedding_size"] else "Create embeddings to unlock fast semantic search."
-            )
-            status_label = "Embeddings Ready" if dataset_summary["embedding_size"] else "Embeddings Missing"
-            st.status(status_label, state="complete" if dataset_summary["embedding_size"] else "running")
-            if dataset_summary["embedding_size"]:
-                st.caption(f"Estimated embedding cost (current dataset): ${estimated_embedding_cost}")
+            st.caption("Embedding Estimate")
+            st.markdown(f"**Estimated cost for this dataset:** `${estimated_embedding_cost}`")
             button_label = "Create Embeddings" if not dataset_summary["embedding_size"] else "Recreate Embeddings"
             button_type = "primary" if not dataset_summary["embedding_size"] else "secondary"
             if st.button(button_label, type=button_type, use_container_width=True):
@@ -1526,7 +1822,6 @@ else:
             venue_count = count_city_venues(selected_city, selected_contract)
             cost_estimate = estimate_embedding_cost_from_reference(
                 venue_count,
-                st.session_state.use_test_dataset,
             )
 
         est1, est2, est3 = st.columns(3)
@@ -1552,7 +1847,6 @@ else:
                         selected_city,
                         selected_contract,
                         crawl_days,
-                        st.session_state.use_test_dataset,
                     )
                     st.rerun()
                 except Exception as e:
@@ -1596,8 +1890,7 @@ if dataset_matches_selected_city:
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing schedule..."):
                     try:
-                        answer, documents = answer_question(rag_components, prompt)
-                        grouped_results = build_result_groups(documents)
+                        answer, grouped_results = answer_question(rag_components, prompt)
                         render_result_groups(answer, grouped_results)
                         st.session_state.messages.append(
                             {

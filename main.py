@@ -8,24 +8,15 @@ def main():
     parser.add_argument("--url", help="Full USC search URL (e.g., https://urbansportsclub.com/de/venues?city_id=1...) to override default search filters.")
     parser.add_argument("--city", type=str, help="Name of the city to scrape (e.g., Köln, Berlin, München, Hamburg, Frankfurt).")
     parser.add_argument("--contract", type=str, default="m", help="Contract tier to crawl: s, m, l, xl. Default=m.")
-    parser.add_argument("--test", action="store_true", help="Run in test mode (limit venues, output to test folder).")
-    parser.add_argument("--limit", type=int, help="Max number of venues to process. Defaults to 5 in test mode.")
+    parser.add_argument("--limit", type=int, help="Max number of venues to process.")
     parser.add_argument("--days", type=int, default=14, help="Number of days to search for classes ahead. Default=14.")
     args = parser.parse_args()
 
     # Configuration
     TEMP_DIR = "temp"
-    if args.test:
-        output_mode_root = "test"
-        if args.limit is None:
-            args.limit = 5
-    else:
-        output_mode_root = "output"
     
     start_time = time.time()
     print("=== USC Venue & Class Scraper ===")
-    if args.test:
-        print("TEST MODE ENABLED")
         
     CITY_MAPPING = {
         "berlin": 1,
@@ -89,7 +80,7 @@ def main():
     if not target_city:
         target_city = "custom"
 
-    output_config = datasets.get_dataset_config(target_city, args.test, contract)
+    output_config = datasets.get_dataset_config(target_city, False, contract)
     OUTPUT_DIR = output_config["dataset_dir"]
     print(f"Writing dataset to: {OUTPUT_DIR}")
     
